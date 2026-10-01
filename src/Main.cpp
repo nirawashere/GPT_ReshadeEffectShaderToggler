@@ -617,7 +617,7 @@ static void displayFHXSafeSettings(effect_runtime*) {
     ImGui::Text("Vertex shaders discovered: %zu", g_vertexShaderManager.getShaderCount());
     ImGui::Text("Compute shaders discovered: %zu", g_computeShaderManager.getShaderCount());
     ImGui::Spacing();
-    ImGui::TextWrapped("Diagnostic build: resource/descriptor/render-target hooks are disabled.");
+    ImGui::TextWrapped("Diagnostic build: resource/descriptor/render-target hooks are disabled. FHX x86 Vulkan test build.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
