@@ -604,6 +604,22 @@ filesystem::path getModulePath(HMODULE module) {
     return GetModuleFileNameW(module, buf, ARRAYSIZE(buf)) ? buf : filesystem::path();
 }
 
+// FHX Restoration / 32-bit DXVK/Vulkan diagnostic safe mode.
+// This first-stage build deliberately avoids REST's resource, descriptor,
+// render-target and effect-runtime interception during process startup.
+// It only registers the add-on, tracks created shader pipelines, and exposes
+// a tiny ReShade settings panel so we can prove the x86 Vulkan path is stable
+// before re-enabling REST functionality incrementally.
+static void displayFHXSafeSettings(effect_runtime*) {
+    ImGui::TextUnformatted("REST FHX Safe Mode");
+    ImGui::Separator();
+    ImGui::Text("Pixel shaders discovered: %zu", g_pixelShaderManager.getShaderCount());
+    ImGui::Text("Vertex shaders discovered: %zu", g_vertexShaderManager.getShaderCount());
+    ImGui::Text("Compute shaders discovered: %zu", g_computeShaderManager.getShaderCount());
+    ImGui::Spacing();
+    ImGui::TextWrapped("Diagnostic build: resource/descriptor/render-target hooks are disabled.");
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
         case DLL_PROCESS_ATTACH:
@@ -612,95 +628,20 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
             }
 
             g_dllPath = getModulePath(hModule);
-
             g_addonUIData.SetBasePath(g_dllPath.parent_path());
             g_addonUIData.LoadShaderTogglerIniFile();
 
-            state_tracking::register_events(g_addonUIData.GetTrackDescriptors());
-            Init();
-
-            reshade::register_event<reshade::addon_event::create_swapchain>(onCreateSwapchain);
-            reshade::register_event<reshade::addon_event::init_swapchain>(onInitSwapchain);
-            reshade::register_event<reshade::addon_event::destroy_swapchain>(onDestroySwapchain);
-            reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
-            reshade::register_event<reshade::addon_event::create_resource>(onCreateResource);
-            reshade::register_event<reshade::addon_event::map_buffer_region>(onMapBufferRegion);
-            reshade::register_event<reshade::addon_event::update_buffer_region>(onUpdateBufferRegion);
-            reshade::register_event<reshade::addon_event::unmap_buffer_region>(onUnmapBufferRegion);
-            reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
-            reshade::register_event<reshade::addon_event::create_resource_view>(onCreateResourceView);
-            reshade::register_event<reshade::addon_event::destroy_resource_view>(onDestroyResourceView);
-            reshade::register_event<reshade::addon_event::init_resource_view>(onInitResourceView);
+            // Safe-mode event set. Keep startup interception to the absolute minimum.
             reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
-            reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
-            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
-            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::register_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
-            reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
-            reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(onReshadeReloadedEffects);
-            reshade::register_event<reshade::addon_event::reshade_set_technique_state>(onReshadeSetTechniqueState);
-            reshade::register_event<reshade::addon_event::reshade_reorder_techniques>(onReshadeReorderTechniques);
-            reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
-            reshade::register_event<reshade::addon_event::init_device>(onInitDevice);
-            reshade::register_event<reshade::addon_event::destroy_device>(onDestroyDevice);
-            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsAndDepthStencil);
-            reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
-            reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
-            reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
-            reshade::register_event<reshade::addon_event::present>(onPresent);
-
-            reshade::register_event<reshade::addon_event::draw>(onDraw);
-            reshade::register_event<reshade::addon_event::dispatch>(onDispatch);
-            reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
-            reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
-
-            reshade::register_overlay(nullptr, &displaySettings);
+            reshade::register_overlay(nullptr, &displayFHXSafeSettings);
             break;
+
         case DLL_PROCESS_DETACH:
-            UnInit();
-            reshade::unregister_event<reshade::addon_event::create_swapchain>(onCreateSwapchain);
-            reshade::unregister_event<reshade::addon_event::init_swapchain>(onInitSwapchain);
-            reshade::unregister_event<reshade::addon_event::destroy_swapchain>(onDestroySwapchain);
-            reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
-            reshade::unregister_event<reshade::addon_event::map_buffer_region>(onMapBufferRegion);
-            reshade::unregister_event<reshade::addon_event::update_buffer_region>(onUpdateBufferRegion);
-            reshade::unregister_event<reshade::addon_event::unmap_buffer_region>(onUnmapBufferRegion);
-            reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
             reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
-            reshade::unregister_event<reshade::addon_event::reshade_overlay>(onReshadeOverlay);
-            reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(onReshadeReloadedEffects);
-            reshade::unregister_event<reshade::addon_event::reshade_set_technique_state>(onReshadeSetTechniqueState);
-            reshade::unregister_event<reshade::addon_event::reshade_reorder_techniques>(onReshadeReorderTechniques);
-            reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
-            reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
-            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
-            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
-            reshade::unregister_event<reshade::addon_event::init_device>(onInitDevice);
-            reshade::unregister_event<reshade::addon_event::destroy_device>(onDestroyDevice);
-            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsAndDepthStencil);
-            reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
-            reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
-            reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
-            reshade::unregister_event<reshade::addon_event::create_resource>(onCreateResource);
-            reshade::unregister_event<reshade::addon_event::init_resource>(onInitResource);
-            reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResource);
-            reshade::unregister_event<reshade::addon_event::create_resource_view>(onCreateResourceView);
-            reshade::unregister_event<reshade::addon_event::init_resource_view>(onInitResourceView);
-            reshade::unregister_event<reshade::addon_event::destroy_resource_view>(onDestroyResourceView);
-            reshade::unregister_event<reshade::addon_event::present>(onPresent);
-
-            reshade::unregister_event<reshade::addon_event::draw>(onDraw);
-            reshade::unregister_event<reshade::addon_event::dispatch>(onDispatch);
-            reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
-            reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
-
-            reshade::unregister_overlay(nullptr, &displaySettings);
-
-            state_tracking::unregister_events();
-
+            reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
+            reshade::unregister_overlay(nullptr, &displayFHXSafeSettings);
             reshade::unregister_addon(hModule);
-
             break;
     }
 
