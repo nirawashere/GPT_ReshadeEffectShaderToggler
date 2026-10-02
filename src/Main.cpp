@@ -685,11 +685,13 @@ enum class FHXBoundaryInjectStatus : uint32_t
     injected
 };
 
+static FHXRenderTargetInfo inspectRenderTargetFHX(command_list *commandList, resource_view view);
+
 static effect_runtime *g_fhxRuntime = nullptr;
 static uint32_t g_fhxOutputWidth = 0;
 static uint32_t g_fhxOutputHeight = 0;
 
-enum class FHXDirectTrigger : uint32_t
+enum class FHXBoundaryTeacher : uint32_t
 {
     primary_ui = 0,
     bars_fullres,
@@ -697,13 +699,51 @@ enum class FHXDirectTrigger : uint32_t
     count
 };
 
+struct FHXPassSignature
+{
+    uint32_t colorCount = 0;
+    uint32_t colorFormat = 0;
+    uint32_t colorWidth = 0;
+    uint32_t colorHeight = 0;
+    uint16_t colorSamples = 0;
+    uint32_t colorLoadOp = 0;
+    uint32_t colorStoreOp = 0;
+
+    bool hasDepth = false;
+    uint32_t depthFormat = 0;
+    uint32_t depthWidth = 0;
+    uint32_t depthHeight = 0;
+    uint16_t depthSamples = 0;
+    uint32_t depthLoadOp = 0;
+    uint32_t depthStoreOp = 0;
+    uint32_t stencilLoadOp = 0;
+    uint32_t stencilStoreOp = 0;
+
+    bool valid = false;
+};
+
+static constexpr uint32_t kFHXSignatureStableFramesRequired = 20;
 static constexpr uint32_t kFHXWarmupSettledPresents = 30;
 
-static uint32_t g_fhxSelectedDirectTrigger = static_cast<uint32_t>(FHXDirectTrigger::primary_ui);
+static uint32_t g_fhxSelectedBoundaryTeacher = static_cast<uint32_t>(FHXBoundaryTeacher::primary_ui);
+
+static std::unordered_map<command_list *, FHXPassSignature> g_fhxCurrentPassSignature;
+static std::unordered_map<command_list *, resource_view> g_fhxCurrentColorView;
+static std::unordered_map<uint64_t, uint32_t> g_fhxCurrentSignatureCounts;
+
+static FHXPassSignature g_fhxObservedTeacherSignature = {};
+static FHXPassSignature g_fhxLearnedSignature = {};
+static uint64_t g_fhxObservedTeacherSignatureKey = 0;
+static uint64_t g_fhxLearnedSignatureKey = 0;
+static uint32_t g_fhxSignatureStableFrames = 0;
+static uint32_t g_fhxLastSignatureOccurrences = 0;
+static uint64_t g_fhxSignatureChanges = 0;
+static uint64_t g_fhxTeacherObservations = 0;
+static uint64_t g_fhxSafeBoundaryHits = 0;
+
 static uint32_t g_fhxRequestedInjectionFrames = 0;
 static uint32_t g_fhxRemainingInjectionFrames = 0;
 static bool g_fhxContinuousInjection = false;
-
 static bool g_fhxWarmupPending = false;
 static bool g_fhxWarmupIssued = false;
 static bool g_fhxWarmupReady = false;
@@ -711,22 +751,11 @@ static uint32_t g_fhxWarmupQuietPresents = 0;
 static uint64_t g_fhxWarmupReloadEvents = 0;
 static uint64_t g_fhxWarmupCount = 0;
 
-static effect_technique g_fhxLumeniteTechnique = {};
-static effect_technique g_fhxDlssTechnique = {};
-
-static std::unordered_map<command_list *, resource_view> g_fhxCurrentColorView;
-
 static uint64_t g_fhxPresentSerial = 0;
 static uint64_t g_fhxLastInjectionPresentSerial = UINT64_MAX;
 static uint64_t g_fhxInjectionCount = 0;
-static uint64_t g_fhxTriggerHits = 0;
-static uint64_t g_fhxStateRestoreCount = 0;
-static uint64_t g_fhxMissingTechniqueCount = 0;
-
-static uint32_t g_fhxLastTriggerHash = 0;
-static uint32_t g_fhxLastTriggerPass = 0;
-static uint64_t g_fhxLastTriggerDraw = 0;
-static uintptr_t g_fhxLastTriggerCommandList = 0;
+static uint64_t g_fhxSkippedAmbiguous = 0;
+static uint64_t g_fhxSkippedUnstable = 0;
 
 static FHXBoundaryInjectStatus g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
 static thread_local bool g_fhxInsideEffectRender = false;
@@ -735,39 +764,133 @@ static const char *fhxBoundaryStatusText(FHXBoundaryInjectStatus status)
 {
     switch (status)
     {
-        case FHXBoundaryInjectStatus::disabled: return "idle";
-        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "warm-up queued";
+        case FHXBoundaryInjectStatus::disabled: return "learning structural UI-pass fingerprint";
+        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "fingerprint not stable yet";
         case FHXBoundaryInjectStatus::waiting_for_candidate: return "warm-up settling";
-        case FHXBoundaryInjectStatus::candidate_detected: return "ready";
+        case FHXBoundaryInjectStatus::candidate_detected: return "stable unique pre-UI boundary ready";
         case FHXBoundaryInjectStatus::armed: return "test armed";
         case FHXBoundaryInjectStatus::no_runtime: return "no ReShade runtime";
-        case FHXBoundaryInjectStatus::effects_disabled: return "required techniques disabled/unavailable";
-        case FHXBoundaryInjectStatus::bad_target: return "trigger hit wrong render target";
+        case FHXBoundaryInjectStatus::effects_disabled: return "ReShade effects disabled";
+        case FHXBoundaryInjectStatus::bad_target: return "boundary target rejected";
         case FHXBoundaryInjectStatus::injected: return "test running";
         default: return "unknown";
     }
 }
 
-static const char *fhxDirectTriggerName(uint32_t trigger)
+static const char *fhxBoundaryTeacherName(uint32_t teacher)
 {
-    switch (static_cast<FHXDirectTrigger>(trigger))
+    switch (static_cast<FHXBoundaryTeacher>(teacher))
     {
-        case FHXDirectTrigger::primary_ui: return "Primary UI 0xCF49F7D6";
-        case FHXDirectTrigger::bars_fullres: return "Bars/full-res 0x30B96240";
-        case FHXDirectTrigger::minimap: return "Minimap 0xAFB6F656";
+        case FHXBoundaryTeacher::primary_ui: return "Primary UI 0xCF49F7D6";
+        case FHXBoundaryTeacher::bars_fullres: return "Bars/full-res 0x30B96240";
+        case FHXBoundaryTeacher::minimap: return "Minimap 0xAFB6F656";
         default: return "Unknown";
     }
 }
 
-static uint32_t fhxDirectTriggerHash(uint32_t trigger)
+static uint32_t fhxBoundaryTeacherHash(uint32_t teacher)
 {
-    switch (static_cast<FHXDirectTrigger>(trigger))
+    switch (static_cast<FHXBoundaryTeacher>(teacher))
     {
-        case FHXDirectTrigger::primary_ui: return 0xCF49F7D6u;
-        case FHXDirectTrigger::bars_fullres: return 0x30B96240u;
-        case FHXDirectTrigger::minimap: return 0xAFB6F656u;
+        case FHXBoundaryTeacher::primary_ui: return 0xCF49F7D6u;
+        case FHXBoundaryTeacher::bars_fullres: return 0x30B96240u;
+        case FHXBoundaryTeacher::minimap: return 0xAFB6F656u;
         default: return 0;
     }
+}
+
+static bool sameFHXPassSignature(const FHXPassSignature &a, const FHXPassSignature &b)
+{
+    return a.valid && b.valid &&
+           a.colorCount == b.colorCount &&
+           a.colorFormat == b.colorFormat &&
+           a.colorWidth == b.colorWidth &&
+           a.colorHeight == b.colorHeight &&
+           a.colorSamples == b.colorSamples &&
+           a.colorLoadOp == b.colorLoadOp &&
+           a.colorStoreOp == b.colorStoreOp &&
+           a.hasDepth == b.hasDepth &&
+           a.depthFormat == b.depthFormat &&
+           a.depthWidth == b.depthWidth &&
+           a.depthHeight == b.depthHeight &&
+           a.depthSamples == b.depthSamples &&
+           a.depthLoadOp == b.depthLoadOp &&
+           a.depthStoreOp == b.depthStoreOp &&
+           a.stencilLoadOp == b.stencilLoadOp &&
+           a.stencilStoreOp == b.stencilStoreOp;
+}
+
+static uint64_t hashFHXPassSignature(const FHXPassSignature &sig)
+{
+    if (!sig.valid)
+        return 0;
+
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+
+    mix(sig.colorCount);
+    mix(sig.colorFormat);
+    mix(sig.colorWidth);
+    mix(sig.colorHeight);
+    mix(sig.colorSamples);
+    mix(sig.colorLoadOp);
+    mix(sig.colorStoreOp);
+    mix(sig.hasDepth ? 1u : 0u);
+    mix(sig.depthFormat);
+    mix(sig.depthWidth);
+    mix(sig.depthHeight);
+    mix(sig.depthSamples);
+    mix(sig.depthLoadOp);
+    mix(sig.depthStoreOp);
+    mix(sig.stencilLoadOp);
+    mix(sig.stencilStoreOp);
+    return h;
+}
+
+static FHXPassSignature buildFHXPassSignature(
+    command_list *commandList,
+    uint32_t count,
+    const render_pass_render_target_desc *rts,
+    const render_pass_depth_stencil_desc *ds)
+{
+    FHXPassSignature sig;
+    if (commandList == nullptr || count == 0 || rts == nullptr || rts[0].view.handle == 0)
+        return sig;
+
+    const FHXRenderTargetInfo color = inspectRenderTargetFHX(commandList, rts[0].view);
+    if (!color.valid)
+        return sig;
+
+    sig.colorCount = count;
+    sig.colorFormat = color.formatValue;
+    sig.colorWidth = color.width;
+    sig.colorHeight = color.height;
+    sig.colorSamples = color.samples;
+    sig.colorLoadOp = static_cast<uint32_t>(rts[0].load_op);
+    sig.colorStoreOp = static_cast<uint32_t>(rts[0].store_op);
+
+    if (ds != nullptr && ds->view.handle != 0)
+    {
+        const FHXRenderTargetInfo depth = inspectRenderTargetFHX(commandList, ds->view);
+        if (depth.valid)
+        {
+            sig.hasDepth = true;
+            sig.depthFormat = depth.formatValue;
+            sig.depthWidth = depth.width;
+            sig.depthHeight = depth.height;
+            sig.depthSamples = depth.samples;
+            sig.depthLoadOp = static_cast<uint32_t>(ds->depth_load_op);
+            sig.depthStoreOp = static_cast<uint32_t>(ds->depth_store_op);
+            sig.stencilLoadOp = static_cast<uint32_t>(ds->stencil_load_op);
+            sig.stencilStoreOp = static_cast<uint32_t>(ds->stencil_store_op);
+        }
+    }
+
+    sig.valid = true;
+    return sig;
 }
 
 static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
@@ -780,27 +903,15 @@ static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
            static_cast<reshade::api::format>(rt.formatValue) == reshade::api::format::b8g8r8a8_unorm;
 }
 
-static void resolveFHXTechniques(effect_runtime *runtime)
+static bool learnedFHXBoundaryReady()
 {
-    if (runtime == nullptr)
-        return;
-
-    g_fhxLumeniteTechnique = runtime->find_technique("lumenite_Kernel.fx", "Lumenite_Kernel");
-    if (g_fhxLumeniteTechnique.handle == 0)
-        g_fhxLumeniteTechnique = runtime->find_technique(nullptr, "Lumenite_Kernel");
-
-    g_fhxDlssTechnique = runtime->find_technique("DLSS5_Feed.fx", "DLSS5_Feed");
-    if (g_fhxDlssTechnique.handle == 0)
-        g_fhxDlssTechnique = runtime->find_technique(nullptr, "DLSS5_Feed");
-
-    const std::string msg = std::format(
-        "[REST FHX] techniques resolved: Lumenite=0x{:X}, DLSS5_Feed=0x{:X}",
-        g_fhxLumeniteTechnique.handle,
-        g_fhxDlssTechnique.handle);
-    reshade::log::message(reshade::log::level::info, msg.c_str());
+    return g_fhxLearnedSignature.valid &&
+           g_fhxLearnedSignatureKey != 0 &&
+           g_fhxSignatureStableFrames >= kFHXSignatureStableFramesRequired &&
+           g_fhxLastSignatureOccurrences == 1;
 }
 
-static void resetFHXDirectTest()
+static void resetFHXBoundaryTest()
 {
     g_fhxRequestedInjectionFrames = 0;
     g_fhxRemainingInjectionFrames = 0;
@@ -809,7 +920,9 @@ static void resetFHXDirectTest()
     g_fhxWarmupIssued = false;
     g_fhxWarmupReady = false;
     g_fhxWarmupQuietPresents = 0;
-    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
+    g_fhxBoundaryInjectStatus = learnedFHXBoundaryReady()
+        ? FHXBoundaryInjectStatus::candidate_detected
+        : FHXBoundaryInjectStatus::disabled;
 }
 
 static void queueFHXInjectionTest(uint32_t frameCount)
@@ -824,73 +937,11 @@ static void queueFHXInjectionTest(uint32_t frameCount)
     g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
 
     const std::string msg = std::format(
-        "[REST FHX] queued direct test: trigger='{}', frames={}",
-        fhxDirectTriggerName(g_fhxSelectedDirectTrigger),
+        "[REST FHX] queued structural-boundary test: teacher='{}', signature=0x{:016X}, frames={}",
+        fhxBoundaryTeacherName(g_fhxSelectedBoundaryTeacher),
+        g_fhxLearnedSignatureKey,
         frameCount);
     reshade::log::message(reshade::log::level::info, msg.c_str());
-}
-
-static bool executeFHXTechniqueChain(
-    command_list *commandList,
-    effect_runtime *runtime,
-    resource_view targetView,
-    const FHXRenderTargetInfo &targetInfo,
-    const char *phase)
-{
-    if (commandList == nullptr || runtime == nullptr || targetView.handle == 0 || !targetInfo.valid)
-        return false;
-
-    if (g_fhxLumeniteTechnique.handle == 0 || g_fhxDlssTechnique.handle == 0)
-        resolveFHXTechniques(runtime);
-
-    if (g_fhxLumeniteTechnique.handle == 0 || g_fhxDlssTechnique.handle == 0 ||
-        !runtime->get_technique_state(g_fhxLumeniteTechnique) ||
-        !runtime->get_technique_state(g_fhxDlssTechnique))
-    {
-        ++g_fhxMissingTechniqueCount;
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
-        reshade::log::message(
-            reshade::log::level::error,
-            "[REST FHX] direct render aborted: Lumenite_Kernel and DLSS5_Feed must both exist and be enabled");
-        return false;
-    }
-
-    const std::string triggerMsg = std::format(
-        "[REST FHX] {} trigger serial={} cmd=0x{:X} draw={} pass={} hash=0x{:08X} target={}x{} fmt={}",
-        phase,
-        g_fhxPresentSerial,
-        reinterpret_cast<uintptr_t>(commandList),
-        g_fhxLastTriggerDraw,
-        g_fhxLastTriggerPass,
-        g_fhxLastTriggerHash,
-        targetInfo.width,
-        targetInfo.height,
-        targetInfo.formatValue);
-    reshade::log::message(reshade::log::level::info, triggerMsg.c_str());
-
-    g_fhxInsideEffectRender = true;
-
-    // Match upstream REST's execution model:
-    // 1) update ReShade uniforms and mark this frame handled without rendering
-    //    the normal Present-time technique chain,
-    // 2) render only the requested techniques,
-    // 3) restore the tracked application command-list state.
-    runtime->render_effects(commandList, resource_view {}, resource_view {});
-    reshade::log::message(reshade::log::level::info, "[REST FHX] stage 1/4: ReShade uniforms updated");
-
-    runtime->render_technique(g_fhxLumeniteTechnique, commandList, targetView, targetView);
-    reshade::log::message(reshade::log::level::info, "[REST FHX] stage 2/4: Lumenite_Kernel rendered");
-
-    runtime->render_technique(g_fhxDlssTechnique, commandList, targetView, targetView);
-    reshade::log::message(reshade::log::level::info, "[REST FHX] stage 3/4: DLSS5_Feed rendered");
-
-    commandList->get_private_data<state_tracking>().apply(commandList);
-    ++g_fhxStateRestoreCount;
-
-    g_fhxInsideEffectRender = false;
-    reshade::log::message(reshade::log::level::info, "[REST FHX] stage 4/4: application state restored");
-
-    return true;
 }
 
 static const char *fhxFormatName(uint32_t value)
@@ -978,7 +1029,7 @@ static void rememberShaderRenderTargetFHX(FHXShaderFrameStat &stat, uint32_t rtI
 static void onBeginRenderPassFHX(command_list *commandList,
                                  uint32_t count,
                                  const render_pass_render_target_desc *rts,
-                                 const render_pass_depth_stencil_desc *)
+                                 const render_pass_depth_stencil_desc *ds)
 {
     if (g_fhxInsideEffectRender || commandList == nullptr)
         return;
@@ -987,12 +1038,141 @@ static void onBeginRenderPassFHX(command_list *commandList,
         (count != 0 && rts != nullptr) ? rts[0].view : resource_view {};
     const FHXRenderTargetInfo rt =
         (targetView.handle != 0) ? inspectRenderTargetFHX(commandList, targetView) : FHXRenderTargetInfo {};
+    const FHXPassSignature signature = buildFHXPassSignature(commandList, count, rts, ds);
+    const uint64_t signatureKey = hashFHXPassSignature(signature);
 
-    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-    const uint32_t passIndex = ++g_fhxNextRenderPass;
-    g_fhxActiveRenderPass[commandList] = passIndex;
-    g_fhxCurrentRenderTarget[commandList] = rt;
-    g_fhxCurrentColorView[commandList] = targetView;
+    effect_runtime *runtime = nullptr;
+    bool performWarmup = false;
+    bool performInjection = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+        const uint32_t passIndex = ++g_fhxNextRenderPass;
+        g_fhxActiveRenderPass[commandList] = passIndex;
+        g_fhxCurrentRenderTarget[commandList] = rt;
+        g_fhxCurrentColorView[commandList] = targetView;
+        g_fhxCurrentPassSignature[commandList] = signature;
+
+        if (signatureKey != 0)
+            ++g_fhxCurrentSignatureCounts[signatureKey];
+
+        const bool testRequested =
+            g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection || g_fhxWarmupPending;
+
+        if (!testRequested)
+            return;
+
+        if (!learnedFHXBoundaryReady())
+        {
+            ++g_fhxSkippedUnstable;
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_ui_prepass;
+            return;
+        }
+
+        if (!sameFHXPassSignature(signature, g_fhxLearnedSignature))
+            return;
+
+        ++g_fhxSafeBoundaryHits;
+
+        // The add-on callback runs before ReShade forwards vkCmdBeginRenderPass,
+        // so this is the safe side of the Vulkan render-pass boundary.
+        if (g_fhxLastInjectionPresentSerial == g_fhxPresentSerial)
+            return;
+
+        if (!isFullResolutionMainTargetFHX(rt) || targetView.handle == 0)
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::bad_target;
+            return;
+        }
+
+        runtime = g_fhxRuntime;
+        if (runtime == nullptr)
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
+            return;
+        }
+
+        g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
+
+        if (g_fhxWarmupPending && !g_fhxWarmupIssued)
+        {
+            g_fhxWarmupPending = false;
+            g_fhxWarmupIssued = true;
+            g_fhxWarmupReady = false;
+            g_fhxWarmupQuietPresents = 0;
+            performWarmup = true;
+        }
+        else if (g_fhxWarmupReady)
+        {
+            performInjection = true;
+        }
+    }
+
+    if (runtime == nullptr)
+        return;
+
+    if (!runtime->get_effects_state())
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
+        return;
+    }
+
+    if (performWarmup)
+    {
+        reshade::log::message(
+            reshade::log::level::info,
+            "[REST FHX] safe-boundary warm-up begin");
+
+        g_fhxInsideEffectRender = true;
+        runtime->render_effects(commandList, targetView, targetView);
+        g_fhxInsideEffectRender = false;
+
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        ++g_fhxWarmupCount;
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
+        reshade::log::message(
+            reshade::log::level::info,
+            "[REST FHX] safe-boundary warm-up end");
+        return;
+    }
+
+    if (!performInjection)
+        return;
+
+    reshade::log::message(
+        reshade::log::level::info,
+        "[REST FHX] safe-boundary render_effects begin");
+
+    g_fhxInsideEffectRender = true;
+    runtime->render_effects(commandList, targetView, targetView);
+    g_fhxInsideEffectRender = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        ++g_fhxInjectionCount;
+
+        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames != 0)
+            --g_fhxRemainingInjectionFrames;
+
+        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames == 0)
+        {
+            g_fhxRequestedInjectionFrames = 0;
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+            reshade::log::message(
+                reshade::log::level::info,
+                "[REST FHX] finite structural-boundary test complete");
+        }
+        else
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::injected;
+        }
+    }
+
+    reshade::log::message(
+        reshade::log::level::info,
+        "[REST FHX] safe-boundary render_effects end");
 }
 
 static void onEndRenderPassFHX(command_list *commandList)
@@ -1004,6 +1184,7 @@ static void onEndRenderPassFHX(command_list *commandList)
     g_fhxActiveRenderPass[commandList] = 0;
     g_fhxCurrentRenderTarget[commandList] = FHXRenderTargetInfo {};
     g_fhxCurrentColorView[commandList] = resource_view {};
+    g_fhxCurrentPassSignature[commandList] = FHXPassSignature {};
 }
 
 static void onBindRenderTargetsFHX(command_list *commandList,
@@ -1032,6 +1213,7 @@ static void onResetCommandListFHX(command_list *commandList)
     g_fhxActiveRenderPass.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
     g_fhxCurrentColorView.erase(commandList);
+    g_fhxCurrentPassSignature.erase(commandList);
 }
 
 static void onDestroyCommandListFHX(command_list *commandList)
@@ -1057,7 +1239,6 @@ static void onInitEffectRuntimeFHX(effect_runtime *runtime)
     g_fhxRuntime = runtime;
     g_fhxOutputWidth = width;
     g_fhxOutputHeight = height;
-    resolveFHXTechniques(runtime);
 }
 
 static void onDestroyEffectRuntimeFHX(effect_runtime *runtime)
@@ -1074,19 +1255,14 @@ static void onReshadeReloadedEffectsFHX(effect_runtime *runtime)
 {
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
 
-    if (runtime != g_fhxRuntime)
+    if (runtime != g_fhxRuntime || !g_fhxWarmupIssued || g_fhxWarmupReady)
         return;
 
-    resolveFHXTechniques(runtime);
-
-    if (g_fhxWarmupIssued && !g_fhxWarmupReady)
-    {
-        g_fhxWarmupQuietPresents = 0;
-        ++g_fhxWarmupReloadEvents;
-        reshade::log::message(
-            reshade::log::level::info,
-            "[REST FHX] effect reload observed during direct-trigger warm-up; settle counter reset");
-    }
+    g_fhxWarmupQuietPresents = 0;
+    ++g_fhxWarmupReloadEvents;
+    reshade::log::message(
+        reshade::log::level::info,
+        "[REST FHX] effect reload observed during safe-boundary warm-up; settle counter reset");
 }
 
 static void profileCurrentDrawFHX(command_list *commandList)
@@ -1111,6 +1287,20 @@ static void profileCurrentDrawFHX(command_list *commandList)
         rt = rtIt->second;
     const uint32_t rtId = getRenderTargetIdFHX(rt);
 
+    if (pixelHash == fhxBoundaryTeacherHash(g_fhxSelectedBoundaryTeacher) &&
+        isFullResolutionMainTargetFHX(rt))
+    {
+        const auto sigIt = g_fhxCurrentPassSignature.find(commandList);
+        if (sigIt != g_fhxCurrentPassSignature.end() && sigIt->second.valid)
+        {
+            if (!g_fhxObservedTeacherSignature.valid)
+            {
+                g_fhxObservedTeacherSignature = sigIt->second;
+                g_fhxObservedTeacherSignatureKey = hashFHXPassSignature(sigIt->second);
+                ++g_fhxTeacherObservations;
+            }
+        }
+    }
 
     FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
     if (stat.count == 0) {
@@ -1166,6 +1356,32 @@ static void onReshadePresentFHX(effect_runtime *runtime)
         ++g_fhxProfiledFrame;
     }
 
+    if (g_fhxObservedTeacherSignature.valid && g_fhxObservedTeacherSignatureKey != 0)
+    {
+        const auto countIt = g_fhxCurrentSignatureCounts.find(g_fhxObservedTeacherSignatureKey);
+        const uint32_t occurrences =
+            countIt != g_fhxCurrentSignatureCounts.end() ? countIt->second : 0;
+
+        if (sameFHXPassSignature(g_fhxObservedTeacherSignature, g_fhxLearnedSignature))
+        {
+            if (occurrences == 1 && g_fhxSignatureStableFrames < 0xFFFFFFFFu)
+                ++g_fhxSignatureStableFrames;
+            else
+                g_fhxSignatureStableFrames = 0;
+        }
+        else
+        {
+            if (g_fhxLearnedSignature.valid)
+                ++g_fhxSignatureChanges;
+
+            g_fhxLearnedSignature = g_fhxObservedTeacherSignature;
+            g_fhxLearnedSignatureKey = g_fhxObservedTeacherSignatureKey;
+            g_fhxSignatureStableFrames = occurrences == 1 ? 1u : 0u;
+        }
+
+        g_fhxLastSignatureOccurrences = occurrences;
+    }
+
     if (g_fhxWarmupIssued && !g_fhxWarmupReady)
     {
         if (g_fhxWarmupQuietPresents < kFHXWarmupSettledPresents)
@@ -1177,17 +1393,26 @@ static void onReshadePresentFHX(effect_runtime *runtime)
             g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
             reshade::log::message(
                 reshade::log::level::info,
-                "[REST FHX] direct-trigger warm-up settled; requested test is live");
+                "[REST FHX] safe-boundary warm-up settled; requested test is live");
         }
         else
         {
             g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
         }
     }
+    else if (g_fhxRemainingInjectionFrames == 0 && !g_fhxContinuousInjection)
+    {
+        g_fhxBoundaryInjectStatus = learnedFHXBoundaryReady()
+            ? FHXBoundaryInjectStatus::candidate_detected
+            : FHXBoundaryInjectStatus::disabled;
+    }
 
     g_fhxCurrentPixelFrame.clear();
     g_fhxCurrentShaderRTFrame.clear();
     g_fhxCurrentRTCatalog.clear();
+    g_fhxCurrentSignatureCounts.clear();
+    g_fhxObservedTeacherSignature = FHXPassSignature {};
+    g_fhxObservedTeacherSignatureKey = 0;
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
 }
@@ -1229,113 +1454,6 @@ static void onBindPipelineFHX(command_list *commandList, pipeline_stage stages, 
         g_fhxSeenComputeShaders.insert(computeHash);
 }
 
-static void tryRunFHXDirectTrigger(command_list *commandList)
-{
-    if (g_fhxInsideEffectRender || commandList == nullptr)
-        return;
-
-    effect_runtime *runtime = nullptr;
-    resource_view targetView = {};
-    FHXRenderTargetInfo targetInfo = {};
-    uint32_t pixelHash = 0;
-    bool runWarmup = false;
-    bool runTest = false;
-
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-
-        const CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
-        pixelHash = data.ps.activeShaderHash;
-
-        if (pixelHash == 0 || pixelHash != fhxDirectTriggerHash(g_fhxSelectedDirectTrigger))
-            return;
-
-        const auto rtIt = g_fhxCurrentRenderTarget.find(commandList);
-        const auto viewIt = g_fhxCurrentColorView.find(commandList);
-        if (rtIt == g_fhxCurrentRenderTarget.end() ||
-            viewIt == g_fhxCurrentColorView.end() ||
-            viewIt->second.handle == 0 ||
-            !isFullResolutionMainTargetFHX(rtIt->second))
-            return;
-
-        if (g_fhxLastInjectionPresentSerial == g_fhxPresentSerial)
-            return;
-
-        const bool testRequested =
-            g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection || g_fhxWarmupPending;
-        if (!testRequested)
-            return;
-
-        runtime = g_fhxRuntime;
-        if (runtime == nullptr)
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
-            return;
-        }
-
-        targetView = viewIt->second;
-        targetInfo = rtIt->second;
-
-        const auto passIt = g_fhxActiveRenderPass.find(commandList);
-        g_fhxLastTriggerHash = pixelHash;
-        g_fhxLastTriggerPass = passIt != g_fhxActiveRenderPass.end() ? passIt->second : 0;
-        g_fhxLastTriggerDraw = g_fhxCurrentDrawIndex + 1;
-        g_fhxLastTriggerCommandList = reinterpret_cast<uintptr_t>(commandList);
-        ++g_fhxTriggerHits;
-
-        g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
-
-        if (g_fhxWarmupPending && !g_fhxWarmupIssued)
-        {
-            g_fhxWarmupPending = false;
-            g_fhxWarmupIssued = true;
-            g_fhxWarmupReady = false;
-            g_fhxWarmupQuietPresents = 0;
-            runWarmup = true;
-        }
-        else if (g_fhxWarmupReady)
-        {
-            runTest = true;
-        }
-    }
-
-    if (!runWarmup && !runTest)
-        return;
-
-    if (runWarmup)
-    {
-        if (executeFHXTechniqueChain(commandList, runtime, targetView, targetInfo, "WARMUP"))
-        {
-            std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-            ++g_fhxWarmupCount;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
-        }
-        return;
-    }
-
-    if (executeFHXTechniqueChain(commandList, runtime, targetView, targetInfo, "TEST"))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        ++g_fhxInjectionCount;
-
-        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames != 0)
-            --g_fhxRemainingInjectionFrames;
-
-        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames == 0)
-        {
-            g_fhxRequestedInjectionFrames = 0;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-            reshade::log::message(
-                reshade::log::level::info,
-                "[REST FHX] finite direct-trigger test complete");
-        }
-        else
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::injected;
-        }
-    }
-}
-
 static bool shouldBlockCurrentDrawFHX(command_list *commandList)
 {
     if (commandList == nullptr)
@@ -1360,14 +1478,12 @@ static bool shouldBlockCurrentDrawFHX(command_list *commandList)
 
 static bool onDrawFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, uint32_t)
 {
-    tryRunFHXDirectTrigger(commandList);
     profileCurrentDrawFHX(commandList);
     return shouldBlockCurrentDrawFHX(commandList);
 }
 
 static bool onDrawIndexedFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
 {
-    tryRunFHXDirectTrigger(commandList);
     profileCurrentDrawFHX(commandList);
     return shouldBlockCurrentDrawFHX(commandList);
 }
@@ -1382,7 +1498,7 @@ static void displayFHXHuntOverlay(effect_runtime *)
     size_t computeCount = 0;
     uint64_t profiledFrame = 0;
 
-    uint32_t directTrigger = 0;
+    uint32_t boundaryTeacher = 0;
     uint32_t requestedFrames = 0;
     uint32_t remainingFrames = 0;
     bool continuousInjection = false;
@@ -1393,16 +1509,16 @@ static void displayFHXHuntOverlay(effect_runtime *)
     uint64_t warmupReloadEvents = 0;
     uint64_t warmupCount = 0;
     uint64_t injectionCount = 0;
-    uint64_t triggerHits = 0;
-    uint64_t stateRestoreCount = 0;
-    uint64_t missingTechniqueCount = 0;
     uint64_t presentSerial = 0;
-    uint32_t lastTriggerHash = 0;
-    uint32_t lastTriggerPass = 0;
-    uint64_t lastTriggerDraw = 0;
-    uintptr_t lastTriggerCommandList = 0;
-    uint64_t lumeniteHandle = 0;
-    uint64_t dlssHandle = 0;
+    uint64_t learnedSignatureKey = 0;
+    uint32_t signatureStableFrames = 0;
+    uint32_t lastSignatureOccurrences = 0;
+    uint64_t signatureChanges = 0;
+    uint64_t teacherObservations = 0;
+    uint64_t safeBoundaryHits = 0;
+    uint64_t skippedAmbiguous = 0;
+    uint64_t skippedUnstable = 0;
+    FHXPassSignature learnedSignature = {};
     FHXBoundaryInjectStatus harnessStatus = FHXBoundaryInjectStatus::disabled;
 
     {
@@ -1419,7 +1535,7 @@ static void displayFHXHuntOverlay(effect_runtime *)
         rtCatalog = g_fhxLastRTCatalog;
         profiledFrame = g_fhxProfiledFrame;
 
-        directTrigger = g_fhxSelectedDirectTrigger;
+        boundaryTeacher = g_fhxSelectedBoundaryTeacher;
         requestedFrames = g_fhxRequestedInjectionFrames;
         remainingFrames = g_fhxRemainingInjectionFrames;
         continuousInjection = g_fhxContinuousInjection;
@@ -1430,16 +1546,16 @@ static void displayFHXHuntOverlay(effect_runtime *)
         warmupReloadEvents = g_fhxWarmupReloadEvents;
         warmupCount = g_fhxWarmupCount;
         injectionCount = g_fhxInjectionCount;
-        triggerHits = g_fhxTriggerHits;
-        stateRestoreCount = g_fhxStateRestoreCount;
-        missingTechniqueCount = g_fhxMissingTechniqueCount;
         presentSerial = g_fhxPresentSerial;
-        lastTriggerHash = g_fhxLastTriggerHash;
-        lastTriggerPass = g_fhxLastTriggerPass;
-        lastTriggerDraw = g_fhxLastTriggerDraw;
-        lastTriggerCommandList = g_fhxLastTriggerCommandList;
-        lumeniteHandle = g_fhxLumeniteTechnique.handle;
-        dlssHandle = g_fhxDlssTechnique.handle;
+        learnedSignatureKey = g_fhxLearnedSignatureKey;
+        signatureStableFrames = g_fhxSignatureStableFrames;
+        lastSignatureOccurrences = g_fhxLastSignatureOccurrences;
+        signatureChanges = g_fhxSignatureChanges;
+        teacherObservations = g_fhxTeacherObservations;
+        safeBoundaryHits = g_fhxSafeBoundaryHits;
+        skippedAmbiguous = g_fhxSkippedAmbiguous;
+        skippedUnstable = g_fhxSkippedUnstable;
+        learnedSignature = g_fhxLearnedSignature;
         harnessStatus = g_fhxBoundaryInjectStatus;
     }
 
@@ -1510,47 +1626,82 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::TextUnformatted("FHX REST-style direct-trigger test harness");
+    ImGui::TextUnformatted("FHX structural pre-UI boundary harness");
     ImGui::Text("Output size: %ux%u", g_fhxOutputWidth, g_fhxOutputHeight);
 
-    const char *triggerItems[] = {
+    const char *teacherItems[] = {
         "Primary UI 0xCF49F7D6",
         "Bars/full-res 0x30B96240",
         "Minimap 0xAFB6F656"
     };
 
-    int selectedTrigger = static_cast<int>(directTrigger);
-    if (ImGui::Combo("Trigger", &selectedTrigger, triggerItems, 3))
+    int selectedTeacher = static_cast<int>(boundaryTeacher);
+    if (ImGui::Combo("Boundary teacher", &selectedTeacher, teacherItems, 3))
     {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxSelectedDirectTrigger = static_cast<uint32_t>(selectedTrigger);
-        resetFHXDirectTest();
+        g_fhxSelectedBoundaryTeacher = static_cast<uint32_t>(selectedTeacher);
+        g_fhxObservedTeacherSignature = FHXPassSignature {};
+        g_fhxLearnedSignature = FHXPassSignature {};
+        g_fhxObservedTeacherSignatureKey = 0;
+        g_fhxLearnedSignatureKey = 0;
+        g_fhxSignatureStableFrames = 0;
+        g_fhxLastSignatureOccurrences = 0;
+        resetFHXBoundaryTest();
     }
 
-    ImGui::Text("Techniques: Lumenite=0x%llX  DLSS5_Feed=0x%llX",
-                static_cast<unsigned long long>(lumeniteHandle),
-                static_cast<unsigned long long>(dlssHandle));
     ImGui::Text("Status: %s", fhxBoundaryStatusText(harnessStatus));
+    ImGui::Text("Learned signature: 0x%016llX | stable %u/%u frames | occurrences last frame %u",
+                static_cast<unsigned long long>(learnedSignatureKey),
+                signatureStableFrames,
+                kFHXSignatureStableFramesRequired,
+                lastSignatureOccurrences);
+    ImGui::Text("Teacher observations: %llu | signature changes: %llu | safe boundary hits: %llu",
+                static_cast<unsigned long long>(teacherObservations),
+                static_cast<unsigned long long>(signatureChanges),
+                static_cast<unsigned long long>(safeBoundaryHits));
+
+    if (learnedSignature.valid)
+    {
+        ImGui::Text("Color: %ux%u fmt=%u samples=%u load=%u store=%u attachments=%u",
+                    learnedSignature.colorWidth,
+                    learnedSignature.colorHeight,
+                    learnedSignature.colorFormat,
+                    static_cast<unsigned>(learnedSignature.colorSamples),
+                    learnedSignature.colorLoadOp,
+                    learnedSignature.colorStoreOp,
+                    learnedSignature.colorCount);
+        ImGui::Text("Depth: %s fmt=%u %ux%u samples=%u load=%u store=%u",
+                    learnedSignature.hasDepth ? "yes" : "no",
+                    learnedSignature.depthFormat,
+                    learnedSignature.depthWidth,
+                    learnedSignature.depthHeight,
+                    static_cast<unsigned>(learnedSignature.depthSamples),
+                    learnedSignature.depthLoadOp,
+                    learnedSignature.depthStoreOp);
+    }
+
     ImGui::Text("Warm-up: %s | quiet presents %u/%u | warmups %llu | reload events %llu",
                 warmupReady ? "READY" : (warmupIssued ? "SETTLING" : (warmupPending ? "QUEUED" : "NOT STARTED")),
                 warmupQuietPresents,
                 kFHXWarmupSettledPresents,
                 static_cast<unsigned long long>(warmupCount),
                 static_cast<unsigned long long>(warmupReloadEvents));
-    ImGui::Text("Last trigger: hash 0x%08X cmd 0x%llX pass %u draw %llu",
-                lastTriggerHash,
-                static_cast<unsigned long long>(lastTriggerCommandList),
-                lastTriggerPass,
-                static_cast<unsigned long long>(lastTriggerDraw));
-    ImGui::Text("Requested/remaining: %u / %u | completed %llu | trigger hits %llu",
+    ImGui::Text("Requested/remaining: %u / %u | completed injections %llu | present serial %llu",
                 requestedFrames,
                 remainingFrames,
                 static_cast<unsigned long long>(injectionCount),
-                static_cast<unsigned long long>(triggerHits));
-    ImGui::Text("State restores: %llu | missing/disabled technique hits: %llu | present serial: %llu",
-                static_cast<unsigned long long>(stateRestoreCount),
-                static_cast<unsigned long long>(missingTechniqueCount),
                 static_cast<unsigned long long>(presentSerial));
+    ImGui::Text("Skipped while unstable: %llu | skipped ambiguous: %llu",
+                static_cast<unsigned long long>(skippedUnstable),
+                static_cast<unsigned long long>(skippedAmbiguous));
+
+    const bool boundaryReady =
+        learnedSignature.valid &&
+        signatureStableFrames >= kFHXSignatureStableFramesRequired &&
+        lastSignatureOccurrences == 1;
+
+    if (!boundaryReady)
+        ImGui::BeginDisabled();
 
     if (ImGui::Button("Test 1 frame"))
     {
@@ -1591,23 +1742,24 @@ static void displayFHXHuntOverlay(effect_runtime *)
             g_fhxWarmupReady = false;
             g_fhxWarmupQuietPresents = 0;
             g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
-            reshade::log::message(reshade::log::level::info, "[REST FHX] continuous direct-trigger test enabled");
         }
         else
         {
             g_fhxWarmupPending = false;
             g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-            reshade::log::message(reshade::log::level::info, "[REST FHX] continuous direct-trigger test disabled");
         }
     }
 
+    if (!boundaryReady)
+        ImGui::EndDisabled();
+
     ImGui::TextWrapped(
-        "No render-pass prediction is used. The selected verified shader directly triggers once per "
-        "present, immediately BEFORE its first full-resolution draw. The first trigger is a warm-up "
-        "only; after 30 quiet presents the requested test begins. Each trigger follows upstream REST: "
-        "render_effects(NULL,NULL), then Lumenite_Kernel, then DLSS5_Feed, then REST state_tracking "
-        "restores the application's Vulkan command-list state. The numeric shader-list positions may "
-        "move between scenes; these actual hash values have remained stable in our captures.");
+        "The UI shader is now only a passive teacher. Its draw records the structural fingerprint "
+        "of the render pass it belongs to; no ReShade work is performed from draw callbacks. Once "
+        "that fingerprint is unique and stable for 20 frames, injection happens on a later frame "
+        "from begin_render_pass, before ReShade forwards vkCmdBeginRenderPass to Vulkan. Resource "
+        "handles and global pass numbers are deliberately excluded, so rotating command buffers "
+        "and scene-dependent pass numbering do not invalidate the boundary.");
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
@@ -1684,9 +1836,9 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "REST-style direct-trigger diagnostic harness. It does not predict render-pass numbers. "
-        "The selected verified UI shader triggers before its draw, only Lumenite_Kernel and "
-        "DLSS5_Feed are rendered manually, and REST state_tracking restores Vulkan state afterward.");
+        "Structural pre-UI boundary harness. Shader hashes are passive teachers only; no rendering "
+        "occurs from draw callbacks. Injection executes only from the safe pre-vkCmdBeginRenderPass "
+        "callback after a unique structural render-pass fingerprint is stable.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
@@ -1697,11 +1849,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
                 return FALSE;
 
             g_dllPath = getModulePath(hModule);
-
-            // Required for safe mid-frame technique rendering on Vulkan.
-            // This is the same state tracker upstream REST uses before calling
-            // render_technique from draw-time triggers.
-            state_tracking::register_events(false);
 
             // Pipeline creation was already verified safe in the previous build.
             reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
@@ -1750,7 +1897,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
             reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
             reshade::unregister_overlay("REST FHX Debug", &displayFHXHuntOverlay);
-            state_tracking::unregister_events();
             reshade::unregister_addon(hModule);
             break;
     }
