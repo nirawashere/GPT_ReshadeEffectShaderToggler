@@ -700,7 +700,7 @@ enum class FHXBoundaryAnchor : uint32_t
 
 static constexpr uint32_t kFHXBoundaryAnchorCount = static_cast<uint32_t>(FHXBoundaryAnchor::count);
 static constexpr uint32_t kFHXBoundaryStableObservations = 3;
-static constexpr uint32_t kFHXWarmupSettledPresents = 3;
+static constexpr uint32_t kFHXWarmupSettledPresents = 30;
 
 struct FHXBoundaryModel
 {
@@ -714,6 +714,8 @@ struct FHXBoundaryModel
 static std::unordered_map<command_list *, FHXBoundaryModel> g_fhxBoundaryModels;
 static std::unordered_map<command_list *, uint32_t> g_fhxLocalPassCounter;
 static std::unordered_map<command_list *, uint32_t> g_fhxActiveLocalPass;
+static std::unordered_map<command_list *, resource_view> g_fhxLastMainTargetView;
+static std::unordered_map<command_list *, FHXRenderTargetInfo> g_fhxLastMainTargetInfo;
 
 static uint32_t g_fhxSelectedBoundaryAnchor = static_cast<uint32_t>(FHXBoundaryAnchor::primary_ui);
 static uint32_t g_fhxRequestedInjectionFrames = 0;
@@ -727,6 +729,7 @@ static uint32_t g_fhxWarmupQuietPresents = 0;
 static uint32_t g_fhxWarmupWidth = 0;
 static uint32_t g_fhxWarmupHeight = 0;
 static uint32_t g_fhxWarmupFormat = 0;
+static uint64_t g_fhxWarmupReloadEvents = 0;
 
 static uint64_t g_fhxPresentSerial = 0;
 static uint64_t g_fhxLastInjectionPresentSerial = UINT64_MAX;
@@ -787,7 +790,7 @@ static uint32_t fhxBoundaryAnchorHash(uint32_t index)
     }
 }
 
-static bool isFullResolutionMainTargetFHXX(const FHXRenderTargetInfo &rt)
+static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
 {
     if (!rt.valid || g_fhxOutputWidth == 0 || g_fhxOutputHeight == 0)
         return false;
@@ -964,6 +967,8 @@ static void onBeginRenderPassFHX(command_list *commandList,
         (targetView.handle != 0) ? inspectRenderTargetFHX(commandList, targetView) : FHXRenderTargetInfo {};
 
     effect_runtime *runtime = nullptr;
+    resource_view effectTargetView = {};
+    FHXRenderTargetInfo effectTargetInfo = {};
     bool performWarmup = false;
     bool performInjection = false;
     uint32_t passIndex = 0;
@@ -978,6 +983,12 @@ static void onBeginRenderPassFHX(command_list *commandList,
         g_fhxActiveRenderPass[commandList] = passIndex;
         g_fhxActiveLocalPass[commandList] = localPassIndex;
         g_fhxCurrentRenderTarget[commandList] = rt;
+
+        if (targetView.handle != 0 && isFullResolutionMainTargetFHX(rt))
+        {
+            g_fhxLastMainTargetView[commandList] = targetView;
+            g_fhxLastMainTargetInfo[commandList] = rt;
+        }
 
         auto modelIt = g_fhxBoundaryModels.find(commandList);
         if (modelIt == g_fhxBoundaryModels.end())
@@ -1014,6 +1025,33 @@ static void onBeginRenderPassFHX(command_list *commandList,
             return;
         }
 
+        // For the final-post control, the upcoming render target is the SRGB
+        // output surface. The completed scene is still in the previous full-res
+        // UNORM main target, so run ReShade on that source immediately before
+        // the game's final post pass. Other anchors render directly on the
+        // upcoming main target.
+        resource_view injectionView = targetView;
+        FHXRenderTargetInfo injectionRT = rt;
+
+        if (static_cast<FHXBoundaryAnchor>(anchorIndex) == FHXBoundaryAnchor::final_post)
+        {
+            const auto viewIt = g_fhxLastMainTargetView.find(commandList);
+            const auto infoIt = g_fhxLastMainTargetInfo.find(commandList);
+
+            if (viewIt == g_fhxLastMainTargetView.end() ||
+                infoIt == g_fhxLastMainTargetInfo.end() ||
+                viewIt->second.handle == 0 ||
+                !isFullResolutionMainTargetFHX(infoIt->second))
+            {
+                ++g_fhxSkippedWrongTarget;
+                g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::bad_target;
+                return;
+            }
+
+            injectionView = viewIt->second;
+            injectionRT = infoIt->second;
+        }
+
         const bool testRequested = g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection;
         if (!testRequested)
         {
@@ -1034,17 +1072,20 @@ static void onBeginRenderPassFHX(command_list *commandList,
             return;
         }
 
-        if (!warmupMatchesTargetFHX(rt))
+        if (!warmupMatchesTargetFHX(injectionRT))
             resetFHXWarmup();
+
+        effectTargetView = injectionView;
+        effectTargetInfo = injectionRT;
 
         if (!g_fhxWarmupIssued)
         {
             g_fhxWarmupIssued = true;
             g_fhxWarmupReady = false;
             g_fhxWarmupQuietPresents = 0;
-            g_fhxWarmupWidth = rt.width;
-            g_fhxWarmupHeight = rt.height;
-            g_fhxWarmupFormat = rt.formatValue;
+            g_fhxWarmupWidth = injectionRT.width;
+            g_fhxWarmupHeight = injectionRT.height;
+            g_fhxWarmupFormat = injectionRT.formatValue;
             g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
             performWarmup = true;
         }
@@ -1066,9 +1107,9 @@ static void onBeginRenderPassFHX(command_list *commandList,
 
     if (performWarmup)
     {
-        logFHXInjectionHeartbeat("warmup", commandList, passIndex, localPassIndex, rt);
+        logFHXInjectionHeartbeat("warmup", commandList, passIndex, localPassIndex, effectTargetInfo);
         g_fhxInsideEffectRender = true;
-        runtime->render_effects(commandList, targetView, targetView);
+        runtime->render_effects(commandList, effectTargetView, effectTargetView);
         g_fhxInsideEffectRender = false;
 
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
@@ -1080,17 +1121,17 @@ static void onBeginRenderPassFHX(command_list *commandList,
     if (!performInjection)
         return;
 
-    if (runtime->is_loading() || !runtime->get_effects_state())
+    if (!runtime->get_effects_state())
     {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
         g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
         return;
     }
 
-    logFHXInjectionHeartbeat("begin", commandList, passIndex, localPassIndex, rt);
+    logFHXInjectionHeartbeat("begin", commandList, passIndex, localPassIndex, effectTargetInfo);
 
     g_fhxInsideEffectRender = true;
-    runtime->render_effects(commandList, targetView, targetView);
+    runtime->render_effects(commandList, effectTargetView, effectTargetView);
     g_fhxInsideEffectRender = false;
 
     {
@@ -1112,7 +1153,7 @@ static void onBeginRenderPassFHX(command_list *commandList,
         }
     }
 
-    logFHXInjectionHeartbeat("end", commandList, passIndex, localPassIndex, rt);
+    logFHXInjectionHeartbeat("end", commandList, passIndex, localPassIndex, effectTargetInfo);
 }
 
 static void onEndRenderPassFHX(command_list *commandList)
@@ -1150,6 +1191,8 @@ static void onResetCommandListFHX(command_list *commandList)
     g_fhxActiveRenderPass.erase(commandList);
     g_fhxActiveLocalPass.erase(commandList);
     g_fhxLocalPassCounter[commandList] = 0;
+    g_fhxLastMainTargetView.erase(commandList);
+    g_fhxLastMainTargetInfo.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
 
     FHXBoundaryModel &model = g_fhxBoundaryModels[commandList];
@@ -1167,6 +1210,8 @@ static void onDestroyCommandListFHX(command_list *commandList)
     g_fhxActiveLocalPass.erase(commandList);
     g_fhxLocalPassCounter.erase(commandList);
     g_fhxBoundaryModels.erase(commandList);
+    g_fhxLastMainTargetView.erase(commandList);
+    g_fhxLastMainTargetInfo.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
 }
 
@@ -1192,6 +1237,21 @@ static void onDestroyEffectRuntimeFHX(effect_runtime *runtime)
         g_fhxOutputWidth = 0;
         g_fhxOutputHeight = 0;
     }
+}
+
+static void onReshadeReloadedEffectsFHX(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    if (runtime != g_fhxRuntime || !g_fhxWarmupIssued || g_fhxWarmupReady)
+        return;
+
+    g_fhxWarmupQuietPresents = 0;
+    ++g_fhxWarmupReloadEvents;
+
+    reshade::log::message(
+        reshade::log::level::info,
+        "[REST FHX] ReShade effect reload observed during custom-target warm-up; settle counter reset");
 }
 
 static void profileCurrentDrawFHX(command_list *commandList)
@@ -1335,20 +1395,20 @@ static void onReshadePresentFHX(effect_runtime *runtime)
     // clean presents have elapsed.
     if (g_fhxWarmupIssued && !g_fhxWarmupReady)
     {
-        if (runtime != nullptr && runtime->is_loading())
-        {
-            g_fhxWarmupQuietPresents = 0;
-        }
-        else
-        {
-            if (g_fhxWarmupQuietPresents < kFHXWarmupSettledPresents)
-                ++g_fhxWarmupQuietPresents;
+        // ReShade API 14 does not expose runtime::is_loading() through effect_runtime.
+        // Instead, reshade_reloaded_effects resets this counter whenever a custom
+        // permutation reload occurs. Thirty quiet presents after the last reload
+        // provides a conservative settle window; if the permutation was already
+        // cached, the counter simply advances without a reload event.
+        if (g_fhxWarmupQuietPresents < kFHXWarmupSettledPresents)
+            ++g_fhxWarmupQuietPresents;
 
-            if (g_fhxWarmupQuietPresents >= kFHXWarmupSettledPresents)
-            {
-                g_fhxWarmupReady = true;
-                reshade::log::message(reshade::log::level::info, "[REST FHX] custom-target permutation warm-up settled; requested test may begin");
-            }
+        if (g_fhxWarmupQuietPresents >= kFHXWarmupSettledPresents)
+        {
+            g_fhxWarmupReady = true;
+            reshade::log::message(
+                reshade::log::level::info,
+                "[REST FHX] custom-target permutation warm-up settled; requested test may begin");
         }
     }
 
@@ -1556,6 +1616,9 @@ static void displayFHXHuntOverlay(effect_runtime *)
     for (const auto &entry : g_fhxBoundaryModels)
     {
         const FHXBoundaryModel &model = entry.second;
+        if (model.observations[g_fhxSelectedBoundaryAnchor] == 0)
+            continue;
+
         ++totalModels;
         if (model.learnedLocalPass[g_fhxSelectedBoundaryAnchor] != 0 &&
             model.stableObservations[g_fhxSelectedBoundaryAnchor] >= kFHXBoundaryStableObservations)
@@ -1570,11 +1633,12 @@ static void displayFHXHuntOverlay(effect_runtime *)
                 static_cast<unsigned long long>(g_fhxLastCandidateDraw));
     ImGui::Text("Status: %s", fhxBoundaryStatusText(g_fhxBoundaryInjectStatus));
 
-    ImGui::Text("Warm-up: %s | quiet presents %u/%u | warmups %llu",
+    ImGui::Text("Warm-up: %s | quiet presents %u/%u | warmups %llu | reload events %llu",
                 g_fhxWarmupReady ? "READY" : (g_fhxWarmupIssued ? "WAITING" : "NOT STARTED"),
                 g_fhxWarmupQuietPresents,
                 kFHXWarmupSettledPresents,
-                static_cast<unsigned long long>(g_fhxWarmupCount));
+                static_cast<unsigned long long>(g_fhxWarmupCount),
+                static_cast<unsigned long long>(g_fhxWarmupReloadEvents));
 
     ImGui::Text("Requested/remaining finite injections: %u / %u",
                 g_fhxRequestedInjectionFrames,
@@ -1630,11 +1694,13 @@ static void displayFHXHuntOverlay(effect_runtime *)
     ImGui::TextWrapped(
         "Each Vulkan command list learns the LOCAL pass containing the selected verified shader. "
         "A boundary must repeat at least 3 times on that command list before it is trusted. "
-        "The first custom-target ReShade render is treated only as a permutation warm-up; the "
-        "actual test waits until ReShade stops loading and 3 additional presents pass. "
-        "Injection remains in begin_render_pass, before the game's Vulkan render pass begins. "
-        "Use Final post as a control: if it is stable while earlier anchors flicker, boundary "
-        "timing is the problem rather than the custom render_effects call itself.");
+        "The first custom-target ReShade render is treated only as a permutation warm-up. "
+        "Any reshade_reloaded_effects event resets the settle timer; the real test begins after "
+        "30 quiet presents. Injection remains in begin_render_pass, before the game's Vulkan "
+        "render pass begins. Final post is a control that processes the completed main UNORM "
+        "scene target immediately before FHX writes its final SRGB output; if that is stable "
+        "while earlier anchors flicker, boundary timing is the problem rather than the custom "
+        "render_effects call itself.");
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
@@ -1740,6 +1806,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
             reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntimeFHX);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntimeFHX);
+            reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(onReshadeReloadedEffectsFHX);
             reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
             reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
             reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
@@ -1761,6 +1828,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
             reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
             reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
+            reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(onReshadeReloadedEffectsFHX);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntimeFHX);
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntimeFHX);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
