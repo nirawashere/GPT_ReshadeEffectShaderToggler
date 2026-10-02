@@ -671,6 +671,63 @@ static uint64_t g_fhxProfiledFrame = 0;
 static uint32_t g_fhxNextRenderPass = 0;
 static bool g_fhxFreezeProfiler = false;
 
+enum class FHXBoundaryInjectStatus : uint32_t
+{
+    disabled,
+    waiting_for_ui_prepass,
+    waiting_for_candidate,
+    candidate_detected,
+    armed,
+    no_runtime,
+    effects_disabled,
+    bad_target,
+    injected
+};
+
+static effect_runtime *g_fhxRuntime = nullptr;
+static uint32_t g_fhxOutputWidth = 0;
+static uint32_t g_fhxOutputHeight = 0;
+
+static bool g_fhxSawUiPrepassThisFrame = false;
+static uint32_t g_fhxFullResPassesAfterUiPrepass = 0;
+static uint32_t g_fhxLastCandidatePass = 0;
+static uint64_t g_fhxLastCandidateDraw = 0;
+static uint64_t g_fhxCandidateHits = 0;
+
+static bool g_fhxArmSingleShotInjection = false;
+static bool g_fhxContinuousInjection = false;
+static bool g_fhxInjectedThisFrame = false;
+static uint64_t g_fhxInjectionCount = 0;
+static FHXBoundaryInjectStatus g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
+static thread_local bool g_fhxInsideEffectRender = false;
+
+static const char *fhxBoundaryStatusText(FHXBoundaryInjectStatus status)
+{
+    switch (status)
+    {
+        case FHXBoundaryInjectStatus::disabled: return "diagnostic only";
+        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "waiting for 256x256 UI prepass";
+        case FHXBoundaryInjectStatus::waiting_for_candidate: return "UI prepass seen; waiting for second full-resolution UNORM pass";
+        case FHXBoundaryInjectStatus::candidate_detected: return "candidate boundary detected";
+        case FHXBoundaryInjectStatus::armed: return "one-shot armed; waiting for candidate";
+        case FHXBoundaryInjectStatus::no_runtime: return "candidate hit, but no ReShade runtime";
+        case FHXBoundaryInjectStatus::effects_disabled: return "candidate hit, but ReShade effects are disabled";
+        case FHXBoundaryInjectStatus::bad_target: return "candidate hit, but target validation failed";
+        case FHXBoundaryInjectStatus::injected: return "ReShade effects injected at safe pre-pass boundary";
+        default: return "unknown";
+    }
+}
+
+static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
+{
+    if (!rt.valid || g_fhxOutputWidth == 0 || g_fhxOutputHeight == 0)
+        return false;
+
+    return rt.width == g_fhxOutputWidth &&
+           rt.height == g_fhxOutputHeight &&
+           static_cast<reshade::api::format>(rt.formatValue) == reshade::api::format::b8g8r8a8_unorm;
+}
+
 static const char *fhxFormatName(uint32_t value)
 {
     switch (static_cast<reshade::api::format>(value))
@@ -758,20 +815,93 @@ static void onBeginRenderPassFHX(command_list *commandList,
                                  const render_pass_render_target_desc *rts,
                                  const render_pass_depth_stencil_desc *)
 {
-    if (commandList == nullptr)
+    if (g_fhxInsideEffectRender || commandList == nullptr)
         return;
 
+    const resource_view targetView =
+        (count != 0 && rts != nullptr) ? rts[0].view : resource_view {};
     const FHXRenderTargetInfo rt =
-        (count != 0 && rts != nullptr) ? inspectRenderTargetFHX(commandList, rts[0].view) : FHXRenderTargetInfo {};
+        (targetView.handle != 0) ? inspectRenderTargetFHX(commandList, targetView) : FHXRenderTargetInfo {};
 
-    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-    g_fhxActiveRenderPass[commandList] = ++g_fhxNextRenderPass;
-    g_fhxCurrentRenderTarget[commandList] = rt;
+    effect_runtime *runtime = nullptr;
+    bool performInjection = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+        const uint32_t passIndex = ++g_fhxNextRenderPass;
+        g_fhxActiveRenderPass[commandList] = passIndex;
+        g_fhxCurrentRenderTarget[commandList] = rt;
+
+        if (g_fhxSawUiPrepassThisFrame && isFullResolutionMainTargetFHX(rt)) {
+            ++g_fhxFullResPassesAfterUiPrepass;
+
+            // FHX's observed sequence after the 256x256 UI prepass is:
+            //   1st full-resolution UNORM pass = late world/scene work
+            //   2nd full-resolution UNORM pass = UI begins almost immediately
+            // ReShade's begin_render_pass callback runs before vkCmdBeginRenderPass,
+            // so this is outside an active Vulkan render pass (unlike the crashed
+            // mid-draw experiment).
+            if (g_fhxFullResPassesAfterUiPrepass == 2) {
+                g_fhxLastCandidatePass = passIndex;
+                g_fhxLastCandidateDraw = g_fhxCurrentDrawIndex + 1;
+                ++g_fhxCandidateHits;
+
+                if (g_fhxArmSingleShotInjection || g_fhxContinuousInjection) {
+                    runtime = g_fhxRuntime;
+                    performInjection = true;
+                    g_fhxInjectedThisFrame = true;
+                    g_fhxArmSingleShotInjection = false;
+                    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+                } else {
+                    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+                }
+            }
+        }
+    }
+
+    if (!performInjection)
+        return;
+
+    if (runtime == nullptr) {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
+        return;
+    }
+
+    if (!runtime->get_effects_state()) {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
+        return;
+    }
+
+    if (targetView.handle == 0 || !rt.valid || !isFullResolutionMainTargetFHX(rt)) {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::bad_target;
+        return;
+    }
+
+    // Important: This call occurs before the game's Vulkan render pass begins.
+    // The old crashing build called render_effects from a draw callback while
+    // Vulkan was already inside a render pass.
+    //
+    // FHX's main target is UNORM. Use the same compatible view for both slots in
+    // this first guarded test. The user's clean baseline has only Lumenite Kernel
+    // and DLSS5 Feed enabled.
+    g_fhxInsideEffectRender = true;
+    runtime->render_effects(commandList, targetView, targetView);
+    g_fhxInsideEffectRender = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        ++g_fhxInjectionCount;
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::injected;
+    }
 }
 
 static void onEndRenderPassFHX(command_list *commandList)
 {
-    if (commandList == nullptr)
+    if (g_fhxInsideEffectRender || commandList == nullptr)
         return;
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
@@ -784,7 +914,7 @@ static void onBindRenderTargetsFHX(command_list *commandList,
                                    const resource_view *rtvs,
                                    resource_view)
 {
-    if (commandList == nullptr)
+    if (g_fhxInsideEffectRender || commandList == nullptr)
         return;
 
     const FHXRenderTargetInfo rt =
@@ -814,9 +944,33 @@ static void onDestroyCommandListFHX(command_list *commandList)
     g_fhxCurrentRenderTarget.erase(commandList);
 }
 
+static void onInitEffectRuntimeFHX(effect_runtime *runtime)
+{
+    if (runtime == nullptr)
+        return;
+
+    uint32_t width = 0, height = 0;
+    runtime->get_screenshot_width_and_height(&width, &height);
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxRuntime = runtime;
+    g_fhxOutputWidth = width;
+    g_fhxOutputHeight = height;
+}
+
+static void onDestroyEffectRuntimeFHX(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    if (g_fhxRuntime == runtime) {
+        g_fhxRuntime = nullptr;
+        g_fhxOutputWidth = 0;
+        g_fhxOutputHeight = 0;
+    }
+}
+
 static void profileCurrentDrawFHX(command_list *commandList)
 {
-    if (commandList == nullptr)
+    if (g_fhxInsideEffectRender || commandList == nullptr)
         return;
 
     const CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
@@ -835,6 +989,14 @@ static void profileCurrentDrawFHX(command_list *commandList)
     if (rtIt != g_fhxCurrentRenderTarget.end())
         rt = rtIt->second;
     const uint32_t rtId = getRenderTargetIdFHX(rt);
+
+    if (pixelHash == 0x30B96240u && rt.valid && rt.width == 256 && rt.height == 256) {
+        g_fhxSawUiPrepassThisFrame = true;
+        if (g_fhxArmSingleShotInjection || g_fhxContinuousInjection)
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
+        else
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
+    }
 
     FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
     if (stat.count == 0) {
@@ -865,9 +1027,19 @@ static void profileCurrentDrawFHX(command_list *commandList)
     }
 }
 
-static void onReshadePresentFHX(effect_runtime *)
+static void onReshadePresentFHX(effect_runtime *runtime)
 {
+    uint32_t width = 0, height = 0;
+    if (runtime != nullptr)
+        runtime->get_screenshot_width_and_height(&width, &height);
+
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    if (runtime != nullptr) {
+        g_fhxRuntime = runtime;
+        g_fhxOutputWidth = width;
+        g_fhxOutputHeight = height;
+    }
 
     if (!g_fhxFreezeProfiler) {
         g_fhxLastPixelFrame = g_fhxCurrentPixelFrame;
@@ -881,11 +1053,21 @@ static void onReshadePresentFHX(effect_runtime *)
     g_fhxCurrentRTCatalog.clear();
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
+    g_fhxSawUiPrepassThisFrame = false;
+    g_fhxFullResPassesAfterUiPrepass = 0;
+    g_fhxInjectedThisFrame = false;
+
+    if (g_fhxArmSingleShotInjection)
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
+    else if (g_fhxContinuousInjection)
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_ui_prepass;
+    else
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
 }
 
 static void onBindPipelineFHX(command_list *commandList, pipeline_stage stages, pipeline pipelineHandle)
 {
-    if (commandList == nullptr || pipelineHandle.handle == 0)
+    if (g_fhxInsideEffectRender || commandList == nullptr || pipelineHandle.handle == 0)
         return;
 
     CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
@@ -1043,6 +1225,32 @@ static void displayFHXHuntOverlay(effect_runtime *)
     ImGui::TextUnformatted("Per-frame draw / render-pass profiler");
     ImGui::Checkbox("Freeze profiler snapshot", &g_fhxFreezeProfiler);
     ImGui::Text("Snapshot frame: %llu", static_cast<unsigned long long>(profiledFrame));
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Safe pre-UI boundary detector / injection test");
+    ImGui::Text("Output size: %ux%u", g_fhxOutputWidth, g_fhxOutputHeight);
+    ImGui::Text("Last candidate: pass %u, before draw %llu",
+                g_fhxLastCandidatePass,
+                static_cast<unsigned long long>(g_fhxLastCandidateDraw));
+    ImGui::Text("Candidate hits: %llu", static_cast<unsigned long long>(g_fhxCandidateHits));
+    ImGui::Text("Injection count: %llu", static_cast<unsigned long long>(g_fhxInjectionCount));
+    ImGui::Text("Status: %s", fhxBoundaryStatusText(g_fhxBoundaryInjectStatus));
+
+    if (ImGui::Button("Arm ONE-SHOT boundary injection")) {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxArmSingleShotInjection = true;
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
+    }
+
+    ImGui::Checkbox("Continuous boundary injection (only after one-shot succeeds)", &g_fhxContinuousInjection);
+    ImGui::TextWrapped(
+        "Candidate logic: observe the known 256x256 bars/UI prepass (0x30B96240), then select "
+        "the second output-sized BGRA8_UNORM render pass. ReShade injection, when armed, occurs "
+        "from begin_render_pass BEFORE Vulkan enters that pass. This deliberately avoids the "
+        "mid-draw path that crashed nvoglv32.dll.");
+
+    ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
 
     for (const auto &[hash, stat] : frameStats) {
@@ -1117,10 +1325,10 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "Diagnostic mode only. No ReShade effect injection is performed. This build records "
-        "shader draw order, render-pass index, render-target identity/format and per-shader "
-        "per-target draw ranges. Descriptor, texture-binding, constant-copy and REST effect "
-        "systems remain disabled.");
+        "Profiler remains diagnostic by default. Optional injection is OFF unless manually armed. "
+        "The guarded test invokes ReShade only at the detected pre-UI begin_render_pass boundary, "
+        "before Vulkan enters the render pass. Descriptor, texture-binding, constant-copy and full "
+        "upstream REST systems remain disabled.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
@@ -1143,6 +1351,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntimeFHX);
+            reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntimeFHX);
             reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
             reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
             reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
@@ -1164,6 +1374,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
             reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
             reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
+            reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntimeFHX);
+            reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntimeFHX);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
