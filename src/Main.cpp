@@ -647,8 +647,21 @@ struct FHXShaderFrameStat
     bool rtOverflow = false;
 };
 
+struct FHXShaderRTStat
+{
+    uint32_t shaderHash = 0;
+    uint32_t rtId = 0;
+    uint64_t firstDraw = 0;
+    uint64_t lastDraw = 0;
+    uint32_t count = 0;
+    uint32_t firstPass = 0;
+    uint32_t lastPass = 0;
+};
+
 static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxCurrentPixelFrame;
 static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxLastPixelFrame;
+static std::unordered_map<uint64_t, FHXShaderRTStat> g_fhxCurrentShaderRTFrame;
+static std::unordered_map<uint64_t, FHXShaderRTStat> g_fhxLastShaderRTFrame;
 static std::unordered_map<command_list *, uint32_t> g_fhxActiveRenderPass;
 static std::unordered_map<command_list *, FHXRenderTargetInfo> g_fhxCurrentRenderTarget;
 static std::vector<FHXRenderTargetInfo> g_fhxCurrentRTCatalog;
@@ -835,6 +848,21 @@ static void profileCurrentDrawFHX(command_list *commandList)
     stat.lastRT = rtId;
     rememberShaderRenderTargetFHX(stat, rtId);
     ++stat.count;
+
+    if (rtId != 0) {
+        const uint64_t pairKey = (static_cast<uint64_t>(pixelHash) << 32) | rtId;
+        FHXShaderRTStat &rtStat = g_fhxCurrentShaderRTFrame[pairKey];
+        if (rtStat.count == 0) {
+            rtStat.shaderHash = pixelHash;
+            rtStat.rtId = rtId;
+            rtStat.firstDraw = drawIndex;
+            rtStat.firstPass = passIndex;
+        }
+
+        rtStat.lastDraw = drawIndex;
+        rtStat.lastPass = passIndex;
+        ++rtStat.count;
+    }
 }
 
 static void onReshadePresentFHX(effect_runtime *)
@@ -843,11 +871,13 @@ static void onReshadePresentFHX(effect_runtime *)
 
     if (!g_fhxFreezeProfiler) {
         g_fhxLastPixelFrame = g_fhxCurrentPixelFrame;
+        g_fhxLastShaderRTFrame = g_fhxCurrentShaderRTFrame;
         g_fhxLastRTCatalog = g_fhxCurrentRTCatalog;
         ++g_fhxProfiledFrame;
     }
 
     g_fhxCurrentPixelFrame.clear();
+    g_fhxCurrentShaderRTFrame.clear();
     g_fhxCurrentRTCatalog.clear();
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
@@ -929,6 +959,7 @@ static void displayFHXHuntOverlay(effect_runtime *)
     std::vector<uint32_t> pixelHashes;
     std::vector<uint32_t> vertexHashes;
     std::vector<std::pair<uint32_t, FHXShaderFrameStat>> frameStats;
+    std::vector<FHXShaderRTStat> shaderRTStats;
     std::vector<FHXRenderTargetInfo> rtCatalog;
     size_t computeCount = 0;
     uint64_t profiledFrame = 0;
@@ -941,6 +972,9 @@ static void displayFHXHuntOverlay(effect_runtime *)
         frameStats.reserve(g_fhxLastPixelFrame.size());
         for (const auto &entry : g_fhxLastPixelFrame)
             frameStats.push_back(entry);
+        shaderRTStats.reserve(g_fhxLastShaderRTFrame.size());
+        for (const auto &entry : g_fhxLastShaderRTFrame)
+            shaderRTStats.push_back(entry.second);
         rtCatalog = g_fhxLastRTCatalog;
         profiledFrame = g_fhxProfiledFrame;
     }
@@ -949,6 +983,12 @@ static void displayFHXHuntOverlay(effect_runtime *)
     std::sort(vertexHashes.begin(), vertexHashes.end());
     std::sort(frameStats.begin(), frameStats.end(),
               [](const auto &a, const auto &b) { return a.second.firstDraw < b.second.firstDraw; });
+    std::sort(shaderRTStats.begin(), shaderRTStats.end(),
+              [](const FHXShaderRTStat &a, const FHXShaderRTStat &b) {
+                  if (a.shaderHash != b.shaderHash)
+                      return a.shaderHash < b.shaderHash;
+                  return a.firstDraw < b.firstDraw;
+              });
 
     auto indexOf = [](const std::vector<uint32_t> &values, uint32_t value) -> int {
         if (values.empty() || value == 0)
@@ -1033,6 +1073,21 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::Separator();
+    ImGui::TextUnformatted("Per-shader / render-target breakdown");
+    ImGui::TextUnformatted("Hash        RT   First   Last   Count  P1  Pn");
+    for (const FHXShaderRTStat &stat : shaderRTStats) {
+        ImGui::Text("0x%08X  %2u  %6llu  %6llu  %5u  %2u  %2u",
+                    stat.shaderHash,
+                    stat.rtId,
+                    static_cast<unsigned long long>(stat.firstDraw),
+                    static_cast<unsigned long long>(stat.lastDraw),
+                    stat.count,
+                    stat.firstPass,
+                    stat.lastPass);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
     ImGui::TextUnformatted("Render-target catalog for frozen frame");
     ImGui::TextUnformatted("ID   View/Resource handles           Size       Fmt  Samples  Format");
     for (size_t i = 0; i < rtCatalog.size(); ++i) {
@@ -1063,8 +1118,8 @@ static void displayFHXHuntOverlay(effect_runtime *)
     ImGui::Spacing();
     ImGui::TextWrapped(
         "Diagnostic mode only. No ReShade effect injection is performed. This build records "
-        "shader draw order, render-pass index and the first bound color render target (view, "
-        "resource, size and format). Descriptor, texture-binding, constant-copy and REST effect "
+        "shader draw order, render-pass index, render-target identity/format and per-shader "
+        "per-target draw ranges. Descriptor, texture-binding, constant-copy and REST effect "
         "systems remain disabled.");
 }
 
