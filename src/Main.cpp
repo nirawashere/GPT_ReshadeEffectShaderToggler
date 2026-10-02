@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <mutex>
 #include <imgui.h>
 #include <reshade.hpp>
 #include <set>
@@ -604,43 +605,574 @@ filesystem::path getModulePath(HMODULE module) {
     return GetModuleFileNameW(module, buf, ARRAYSIZE(buf)) ? buf : filesystem::path();
 }
 
-// FHX Restoration / 32-bit DXVK/Vulkan diagnostic safe mode.
-// This first-stage build deliberately avoids REST's resource, descriptor,
-// render-target and effect-runtime interception during process startup.
-// It only registers the add-on, tracks created shader pipelines, and exposes
-// a tiny ReShade settings panel so we can prove the x86 Vulkan path is stable
-// before re-enabling REST functionality incrementally.
-static void displayFHXSafeSettings(effect_runtime*) {
-    ImGui::TextUnformatted("REST FHX Safe Mode");
-    ImGui::Separator();
-    ImGui::Text("Pixel shaders discovered: %zu", g_pixelShaderManager.getShaderCount());
-    ImGui::Text("Vertex shaders discovered: %zu", g_vertexShaderManager.getShaderCount());
-    ImGui::Text("Compute shaders discovered: %zu", g_computeShaderManager.getShaderCount());
-    ImGui::Spacing();
-    ImGui::TextWrapped("Diagnostic build: resource/descriptor/render-target hooks are disabled. FHX x86 Vulkan test build.");
+// FHX Restoration / 32-bit DXVK/Vulkan shader-hunting diagnostic mode.
+//
+// This intentionally stays independent from REST's resource/descriptor/render-target
+// machinery. It tracks shaders exposed by ReShade's Vulkan API, tracks the currently
+// bound shader on each command list, and can suppress draws matching one selected
+// pixel or vertex shader. This is enough to identify FHX UI shaders without enabling
+// the subsystems implicated in the upstream startup crash.
+static std::mutex g_fhxHuntMutex;
+static std::unordered_set<uint32_t> g_fhxSeenPixelShaders;
+static std::unordered_set<uint32_t> g_fhxSeenVertexShaders;
+static std::unordered_set<uint32_t> g_fhxSeenComputeShaders;
+
+static uint32_t g_fhxSelectedPixelHash = 0;
+static uint32_t g_fhxSelectedVertexHash = 0;
+static bool g_fhxBlockSelectedPixel = false;
+static bool g_fhxBlockSelectedVertex = false;
+
+struct FHXRenderTargetInfo
+{
+    uint64_t viewHandle = 0;
+    uint64_t resourceHandle = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t formatValue = 0;
+    uint16_t samples = 0;
+    bool valid = false;
+};
+
+struct FHXShaderFrameStat
+{
+    uint64_t firstDraw = 0;
+    uint64_t lastDraw = 0;
+    uint32_t count = 0;
+    uint32_t firstPass = 0;
+    uint32_t lastPass = 0;
+    uint32_t firstRT = 0;
+    uint32_t lastRT = 0;
+    uint32_t rtIds[4] = {};
+    uint32_t rtCount = 0;
+    bool rtOverflow = false;
+};
+
+struct FHXShaderRTStat
+{
+    uint32_t shaderHash = 0;
+    uint32_t rtId = 0;
+    uint64_t firstDraw = 0;
+    uint64_t lastDraw = 0;
+    uint32_t count = 0;
+    uint32_t firstPass = 0;
+    uint32_t lastPass = 0;
+};
+
+static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxCurrentPixelFrame;
+static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxLastPixelFrame;
+static std::unordered_map<uint64_t, FHXShaderRTStat> g_fhxCurrentShaderRTFrame;
+static std::unordered_map<uint64_t, FHXShaderRTStat> g_fhxLastShaderRTFrame;
+static std::unordered_map<command_list *, uint32_t> g_fhxActiveRenderPass;
+static std::unordered_map<command_list *, FHXRenderTargetInfo> g_fhxCurrentRenderTarget;
+static std::vector<FHXRenderTargetInfo> g_fhxCurrentRTCatalog;
+static std::vector<FHXRenderTargetInfo> g_fhxLastRTCatalog;
+static uint64_t g_fhxCurrentDrawIndex = 0;
+static uint64_t g_fhxProfiledFrame = 0;
+static uint32_t g_fhxNextRenderPass = 0;
+static bool g_fhxFreezeProfiler = false;
+
+static const char *fhxFormatName(uint32_t value)
+{
+    switch (static_cast<reshade::api::format>(value))
+    {
+        case reshade::api::format::r8g8b8a8_unorm: return "RGBA8_UNORM";
+        case reshade::api::format::r8g8b8a8_unorm_srgb: return "RGBA8_SRGB";
+        case reshade::api::format::b8g8r8a8_unorm: return "BGRA8_UNORM";
+        case reshade::api::format::b8g8r8a8_unorm_srgb: return "BGRA8_SRGB";
+        case reshade::api::format::r10g10b10a2_unorm: return "RGB10A2_UNORM";
+        case reshade::api::format::r11g11b10_float: return "R11G11B10_FLOAT";
+        case reshade::api::format::r16g16b16a16_float: return "RGBA16_FLOAT";
+        default: return "other";
+    }
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
+static FHXRenderTargetInfo inspectRenderTargetFHX(command_list *commandList, resource_view view)
+{
+    FHXRenderTargetInfo info;
+    info.viewHandle = view.handle;
+
+    if (commandList == nullptr || view.handle == 0)
+        return info;
+
+    device *dev = commandList->get_device();
+    if (dev == nullptr)
+        return info;
+
+    const resource resourceHandle = dev->get_resource_from_view(view);
+    if (resourceHandle.handle == 0)
+        return info;
+
+    const resource_desc resourceDesc = dev->get_resource_desc(resourceHandle);
+    const resource_view_desc viewDesc = dev->get_resource_view_desc(view);
+
+    info.resourceHandle = resourceHandle.handle;
+    info.width = resourceDesc.texture.width;
+    info.height = resourceDesc.texture.height;
+    info.samples = resourceDesc.texture.samples;
+    info.formatValue = static_cast<uint32_t>(
+        viewDesc.format != format::unknown ? viewDesc.format : resourceDesc.texture.format);
+    info.valid = true;
+    return info;
+}
+
+static bool sameRenderTargetFHX(const FHXRenderTargetInfo &a, const FHXRenderTargetInfo &b)
+{
+    return a.valid && b.valid &&
+           a.viewHandle == b.viewHandle &&
+           a.resourceHandle == b.resourceHandle &&
+           a.width == b.width &&
+           a.height == b.height &&
+           a.formatValue == b.formatValue;
+}
+
+static uint32_t getRenderTargetIdFHX(const FHXRenderTargetInfo &info)
+{
+    if (!info.valid)
+        return 0;
+
+    for (size_t i = 0; i < g_fhxCurrentRTCatalog.size(); ++i)
+        if (sameRenderTargetFHX(g_fhxCurrentRTCatalog[i], info))
+            return static_cast<uint32_t>(i + 1);
+
+    g_fhxCurrentRTCatalog.push_back(info);
+    return static_cast<uint32_t>(g_fhxCurrentRTCatalog.size());
+}
+
+static void rememberShaderRenderTargetFHX(FHXShaderFrameStat &stat, uint32_t rtId)
+{
+    if (rtId == 0)
+        return;
+
+    for (uint32_t i = 0; i < stat.rtCount; ++i)
+        if (stat.rtIds[i] == rtId)
+            return;
+
+    if (stat.rtCount < 4)
+        stat.rtIds[stat.rtCount++] = rtId;
+    else
+        stat.rtOverflow = true;
+}
+
+static void onBeginRenderPassFHX(command_list *commandList,
+                                 uint32_t count,
+                                 const render_pass_render_target_desc *rts,
+                                 const render_pass_depth_stencil_desc *)
+{
+    if (commandList == nullptr)
+        return;
+
+    const FHXRenderTargetInfo rt =
+        (count != 0 && rts != nullptr) ? inspectRenderTargetFHX(commandList, rts[0].view) : FHXRenderTargetInfo {};
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass[commandList] = ++g_fhxNextRenderPass;
+    g_fhxCurrentRenderTarget[commandList] = rt;
+}
+
+static void onEndRenderPassFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass[commandList] = 0;
+    g_fhxCurrentRenderTarget[commandList] = FHXRenderTargetInfo {};
+}
+
+static void onBindRenderTargetsFHX(command_list *commandList,
+                                   uint32_t count,
+                                   const resource_view *rtvs,
+                                   resource_view)
+{
+    if (commandList == nullptr)
+        return;
+
+    const FHXRenderTargetInfo rt =
+        (count != 0 && rtvs != nullptr) ? inspectRenderTargetFHX(commandList, rtvs[0]) : FHXRenderTargetInfo {};
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxCurrentRenderTarget[commandList] = rt;
+}
+
+static void onResetCommandListFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass.erase(commandList);
+    g_fhxCurrentRenderTarget.erase(commandList);
+}
+
+static void onDestroyCommandListFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass.erase(commandList);
+    g_fhxCurrentRenderTarget.erase(commandList);
+}
+
+static void profileCurrentDrawFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    const CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
+    const uint32_t pixelHash = data.ps.activeShaderHash;
+    if (pixelHash == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    const uint64_t drawIndex = ++g_fhxCurrentDrawIndex;
+    const auto passIt = g_fhxActiveRenderPass.find(commandList);
+    const uint32_t passIndex = (passIt != g_fhxActiveRenderPass.end()) ? passIt->second : 0;
+
+    FHXRenderTargetInfo rt;
+    const auto rtIt = g_fhxCurrentRenderTarget.find(commandList);
+    if (rtIt != g_fhxCurrentRenderTarget.end())
+        rt = rtIt->second;
+    const uint32_t rtId = getRenderTargetIdFHX(rt);
+
+    FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
+    if (stat.count == 0) {
+        stat.firstDraw = drawIndex;
+        stat.firstPass = passIndex;
+        stat.firstRT = rtId;
+    }
+
+    stat.lastDraw = drawIndex;
+    stat.lastPass = passIndex;
+    stat.lastRT = rtId;
+    rememberShaderRenderTargetFHX(stat, rtId);
+    ++stat.count;
+
+    if (rtId != 0) {
+        const uint64_t pairKey = (static_cast<uint64_t>(pixelHash) << 32) | rtId;
+        FHXShaderRTStat &rtStat = g_fhxCurrentShaderRTFrame[pairKey];
+        if (rtStat.count == 0) {
+            rtStat.shaderHash = pixelHash;
+            rtStat.rtId = rtId;
+            rtStat.firstDraw = drawIndex;
+            rtStat.firstPass = passIndex;
+        }
+
+        rtStat.lastDraw = drawIndex;
+        rtStat.lastPass = passIndex;
+        ++rtStat.count;
+    }
+}
+
+static void onReshadePresentFHX(effect_runtime *)
+{
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    if (!g_fhxFreezeProfiler) {
+        g_fhxLastPixelFrame = g_fhxCurrentPixelFrame;
+        g_fhxLastShaderRTFrame = g_fhxCurrentShaderRTFrame;
+        g_fhxLastRTCatalog = g_fhxCurrentRTCatalog;
+        ++g_fhxProfiledFrame;
+    }
+
+    g_fhxCurrentPixelFrame.clear();
+    g_fhxCurrentShaderRTFrame.clear();
+    g_fhxCurrentRTCatalog.clear();
+    g_fhxCurrentDrawIndex = 0;
+    g_fhxNextRenderPass = 0;
+}
+
+static void onBindPipelineFHX(command_list *commandList, pipeline_stage stages, pipeline pipelineHandle)
+{
+    if (commandList == nullptr || pipelineHandle.handle == 0)
+        return;
+
+    CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
+
+    uint32_t pixelHash = 0;
+    uint32_t vertexHash = 0;
+    uint32_t computeHash = 0;
+
+    if ((uint32_t)(stages & pipeline_stage::pixel_shader))
+        pixelHash = g_pixelShaderManager.safeGetShaderHash(pipelineHandle.handle);
+    if ((uint32_t)(stages & pipeline_stage::vertex_shader))
+        vertexHash = g_vertexShaderManager.safeGetShaderHash(pipelineHandle.handle);
+    if ((uint32_t)(stages & pipeline_stage::compute_shader))
+        computeHash = g_computeShaderManager.safeGetShaderHash(pipelineHandle.handle);
+
+    if (pixelHash != 0)
+        data.ps.activeShaderHash = pixelHash;
+    if (vertexHash != 0)
+        data.vs.activeShaderHash = vertexHash;
+    if (computeHash != 0)
+        data.cs.activeShaderHash = computeHash;
+
+    if (pixelHash == 0 && vertexHash == 0 && computeHash == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    if (pixelHash != 0)
+        g_fhxSeenPixelShaders.insert(pixelHash);
+    if (vertexHash != 0)
+        g_fhxSeenVertexShaders.insert(vertexHash);
+    if (computeHash != 0)
+        g_fhxSeenComputeShaders.insert(computeHash);
+}
+
+static bool shouldBlockCurrentDrawFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return false;
+
+    const CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    if (g_fhxBlockSelectedPixel &&
+        g_fhxSelectedPixelHash != 0 &&
+        data.ps.activeShaderHash == g_fhxSelectedPixelHash)
+        return true;
+
+    if (g_fhxBlockSelectedVertex &&
+        g_fhxSelectedVertexHash != 0 &&
+        data.vs.activeShaderHash == g_fhxSelectedVertexHash)
+        return true;
+
+    return false;
+}
+
+static bool onDrawFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, uint32_t)
+{
+    profileCurrentDrawFHX(commandList);
+    return shouldBlockCurrentDrawFHX(commandList);
+}
+
+static bool onDrawIndexedFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
+{
+    profileCurrentDrawFHX(commandList);
+    return shouldBlockCurrentDrawFHX(commandList);
+}
+
+static void displayFHXHuntOverlay(effect_runtime *)
+{
+    std::vector<uint32_t> pixelHashes;
+    std::vector<uint32_t> vertexHashes;
+    std::vector<std::pair<uint32_t, FHXShaderFrameStat>> frameStats;
+    std::vector<FHXShaderRTStat> shaderRTStats;
+    std::vector<FHXRenderTargetInfo> rtCatalog;
+    size_t computeCount = 0;
+    uint64_t profiledFrame = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        pixelHashes.assign(g_fhxSeenPixelShaders.begin(), g_fhxSeenPixelShaders.end());
+        vertexHashes.assign(g_fhxSeenVertexShaders.begin(), g_fhxSeenVertexShaders.end());
+        computeCount = g_fhxSeenComputeShaders.size();
+        frameStats.reserve(g_fhxLastPixelFrame.size());
+        for (const auto &entry : g_fhxLastPixelFrame)
+            frameStats.push_back(entry);
+        shaderRTStats.reserve(g_fhxLastShaderRTFrame.size());
+        for (const auto &entry : g_fhxLastShaderRTFrame)
+            shaderRTStats.push_back(entry.second);
+        rtCatalog = g_fhxLastRTCatalog;
+        profiledFrame = g_fhxProfiledFrame;
+    }
+
+    std::sort(pixelHashes.begin(), pixelHashes.end());
+    std::sort(vertexHashes.begin(), vertexHashes.end());
+    std::sort(frameStats.begin(), frameStats.end(),
+              [](const auto &a, const auto &b) { return a.second.firstDraw < b.second.firstDraw; });
+    std::sort(shaderRTStats.begin(), shaderRTStats.end(),
+              [](const FHXShaderRTStat &a, const FHXShaderRTStat &b) {
+                  if (a.shaderHash != b.shaderHash)
+                      return a.shaderHash < b.shaderHash;
+                  return a.firstDraw < b.firstDraw;
+              });
+
+    auto indexOf = [](const std::vector<uint32_t> &values, uint32_t value) -> int {
+        if (values.empty() || value == 0)
+            return -1;
+        const auto it = std::lower_bound(values.begin(), values.end(), value);
+        return (it != values.end() && *it == value) ? static_cast<int>(std::distance(values.begin(), it)) : -1;
+    };
+
+    ImGui::TextUnformatted("FHX 32-bit DXVK/Vulkan Shader Hunter");
+    ImGui::Separator();
+    ImGui::Text("Seen pixel shaders: %zu", pixelHashes.size());
+    ImGui::Text("Seen vertex shaders: %zu", vertexHashes.size());
+    ImGui::Text("Seen compute shaders: %zu", computeCount);
+    ImGui::Spacing();
+
+    int pixelIndex = indexOf(pixelHashes, g_fhxSelectedPixelHash);
+    ImGui::Text("Selected pixel shader: %u (0x%08X)", g_fhxSelectedPixelHash, g_fhxSelectedPixelHash);
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%d / %zu]", pixelIndex >= 0 ? pixelIndex + 1 : 0, pixelHashes.size());
+
+    if (ImGui::Button("Previous Pixel") && !pixelHashes.empty()) {
+        const int next = pixelIndex <= 0 ? static_cast<int>(pixelHashes.size()) - 1 : pixelIndex - 1;
+        g_fhxSelectedPixelHash = pixelHashes[next];
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next Pixel") && !pixelHashes.empty()) {
+        const int next = (pixelIndex < 0 || pixelIndex + 1 >= static_cast<int>(pixelHashes.size())) ? 0 : pixelIndex + 1;
+        g_fhxSelectedPixelHash = pixelHashes[next];
+    }
+    ImGui::Checkbox("Suppress draws using selected pixel shader", &g_fhxBlockSelectedPixel);
+
+    ImGui::Spacing();
+
+    int vertexIndex = indexOf(vertexHashes, g_fhxSelectedVertexHash);
+    ImGui::Text("Selected vertex shader: %u (0x%08X)", g_fhxSelectedVertexHash, g_fhxSelectedVertexHash);
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%d / %zu]", vertexIndex >= 0 ? vertexIndex + 1 : 0, vertexHashes.size());
+
+    if (ImGui::Button("Previous Vertex") && !vertexHashes.empty()) {
+        const int next = vertexIndex <= 0 ? static_cast<int>(vertexHashes.size()) - 1 : vertexIndex - 1;
+        g_fhxSelectedVertexHash = vertexHashes[next];
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next Vertex") && !vertexHashes.empty()) {
+        const int next = (vertexIndex < 0 || vertexIndex + 1 >= static_cast<int>(vertexHashes.size())) ? 0 : vertexIndex + 1;
+        g_fhxSelectedVertexHash = vertexHashes[next];
+    }
+    ImGui::Checkbox("Suppress draws using selected vertex shader", &g_fhxBlockSelectedVertex);
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Per-frame draw / render-pass profiler");
+    ImGui::Checkbox("Freeze profiler snapshot", &g_fhxFreezeProfiler);
+    ImGui::Text("Snapshot frame: %llu", static_cast<unsigned long long>(profiledFrame));
+    ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
+
+    for (const auto &[hash, stat] : frameStats) {
+        const char *note = "";
+        switch (hash) {
+            case 0xCF49F7D6u: note = "primary UI"; break;
+            case 0x30B96240u: note = "bars"; break;
+            case 0xAFB6F656u: note = "minimap"; break;
+            case 0xBBB19C94u: note = "minimap"; break;
+            case 0xDEA3862Du: note = "mixed world/UI"; break;
+            case 0x64787F0Fu: note = "post-process"; break;
+            default: break;
+        }
+
+        ImGui::Text("0x%08X  %5llu  %5llu  %5u  %2u  %2u  %2u  %2u  %2u%s  %s",
+                    hash,
+                    static_cast<unsigned long long>(stat.firstDraw),
+                    static_cast<unsigned long long>(stat.lastDraw),
+                    stat.count,
+                    stat.firstPass,
+                    stat.lastPass,
+                    stat.firstRT,
+                    stat.lastRT,
+                    stat.rtCount,
+                    stat.rtOverflow ? "+" : " ",
+                    note);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Per-shader / render-target breakdown");
+    ImGui::TextUnformatted("Hash        RT   First   Last   Count  P1  Pn");
+    for (const FHXShaderRTStat &stat : shaderRTStats) {
+        ImGui::Text("0x%08X  %2u  %6llu  %6llu  %5u  %2u  %2u",
+                    stat.shaderHash,
+                    stat.rtId,
+                    static_cast<unsigned long long>(stat.firstDraw),
+                    static_cast<unsigned long long>(stat.lastDraw),
+                    stat.count,
+                    stat.firstPass,
+                    stat.lastPass);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Render-target catalog for frozen frame");
+    ImGui::TextUnformatted("ID   View/Resource handles           Size       Fmt  Samples  Format");
+    for (size_t i = 0; i < rtCatalog.size(); ++i) {
+        const FHXRenderTargetInfo &rt = rtCatalog[i];
+        ImGui::Text("%2u   %08llX/%08llX  %4ux%-4u  %3u     %u    %s",
+                    static_cast<unsigned>(i + 1),
+                    static_cast<unsigned long long>(rt.viewHandle),
+                    static_cast<unsigned long long>(rt.resourceHandle),
+                    rt.width,
+                    rt.height,
+                    rt.formatValue,
+                    static_cast<unsigned>(rt.samples),
+                    fhxFormatName(rt.formatValue));
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Clear observed shader list")) {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxSeenPixelShaders.clear();
+        g_fhxSeenVertexShaders.clear();
+        g_fhxSeenComputeShaders.clear();
+        g_fhxSelectedPixelHash = 0;
+        g_fhxSelectedVertexHash = 0;
+        g_fhxBlockSelectedPixel = false;
+        g_fhxBlockSelectedVertex = false;
+    }
+
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "Diagnostic mode only. No ReShade effect injection is performed. This build records "
+        "shader draw order, render-pass index, render-target identity/format and per-shader "
+        "per-target draw ranges. Descriptor, texture-binding, constant-copy and REST effect "
+        "systems remain disabled.");
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
+{
     switch (fdwReason) {
         case DLL_PROCESS_ATTACH:
-            if (!reshade::register_addon(hModule)) {
+            if (!reshade::register_addon(hModule))
                 return FALSE;
-            }
 
             g_dllPath = getModulePath(hModule);
-            g_addonUIData.SetBasePath(g_dllPath.parent_path());
-            g_addonUIData.LoadShaderTogglerIniFile();
 
-            // Safe-mode event set. Keep startup interception to the absolute minimum.
+            // Pipeline creation was already verified safe in the previous build.
             reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::register_overlay(nullptr, &displayFHXSafeSettings);
+
+            // Minimal command-list state needed for shader hunting.
+            reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
+            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
+            reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
+            reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
+            reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
+
+            // Draw suppression is still the only rendering modification in this build.
+            // The additional callbacks only record render-pass timing.
+            reshade::register_event<reshade::addon_event::draw>(onDrawFHX);
+            reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexedFHX);
+            reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresentFHX);
+
+            // Give this build an explicit named overlay tab.
+            reshade::register_overlay("REST FHX Debug", &displayFHXHuntOverlay);
             break;
 
         case DLL_PROCESS_DETACH:
-            reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
+            reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresentFHX);
+            reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexedFHX);
+            reshade::unregister_event<reshade::addon_event::draw>(onDrawFHX);
+            reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
+            reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
+            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
+            reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
             reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::unregister_overlay(nullptr, &displayFHXSafeSettings);
+            reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
+            reshade::unregister_overlay("REST FHX Debug", &displayFHXHuntOverlay);
             reshade::unregister_addon(hModule);
             break;
     }
