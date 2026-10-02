@@ -622,6 +622,17 @@ static uint32_t g_fhxSelectedVertexHash = 0;
 static bool g_fhxBlockSelectedPixel = false;
 static bool g_fhxBlockSelectedVertex = false;
 
+struct FHXRenderTargetInfo
+{
+    uint64_t viewHandle = 0;
+    uint64_t resourceHandle = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t formatValue = 0;
+    uint16_t samples = 0;
+    bool valid = false;
+};
+
 struct FHXShaderFrameStat
 {
     uint64_t firstDraw = 0;
@@ -629,26 +640,120 @@ struct FHXShaderFrameStat
     uint32_t count = 0;
     uint32_t firstPass = 0;
     uint32_t lastPass = 0;
+    uint32_t firstRT = 0;
+    uint32_t lastRT = 0;
+    uint32_t rtIds[4] = {};
+    uint32_t rtCount = 0;
+    bool rtOverflow = false;
 };
 
 static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxCurrentPixelFrame;
 static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxLastPixelFrame;
 static std::unordered_map<command_list *, uint32_t> g_fhxActiveRenderPass;
+static std::unordered_map<command_list *, FHXRenderTargetInfo> g_fhxCurrentRenderTarget;
+static std::vector<FHXRenderTargetInfo> g_fhxCurrentRTCatalog;
+static std::vector<FHXRenderTargetInfo> g_fhxLastRTCatalog;
 static uint64_t g_fhxCurrentDrawIndex = 0;
 static uint64_t g_fhxProfiledFrame = 0;
 static uint32_t g_fhxNextRenderPass = 0;
 static bool g_fhxFreezeProfiler = false;
 
+static const char *fhxFormatName(uint32_t value)
+{
+    switch (static_cast<format>(value))
+    {
+        case format::r8g8b8a8_unorm: return "RGBA8_UNORM";
+        case format::r8g8b8a8_unorm_srgb: return "RGBA8_SRGB";
+        case format::b8g8r8a8_unorm: return "BGRA8_UNORM";
+        case format::b8g8r8a8_unorm_srgb: return "BGRA8_SRGB";
+        case format::r10g10b10a2_unorm: return "RGB10A2_UNORM";
+        case format::r11g11b10_float: return "R11G11B10_FLOAT";
+        case format::r16g16b16a16_float: return "RGBA16_FLOAT";
+        default: return "other";
+    }
+}
+
+static FHXRenderTargetInfo inspectRenderTargetFHX(command_list *commandList, resource_view view)
+{
+    FHXRenderTargetInfo info;
+    info.viewHandle = view.handle;
+
+    if (commandList == nullptr || view.handle == 0)
+        return info;
+
+    device *dev = commandList->get_device();
+    if (dev == nullptr)
+        return info;
+
+    const resource resourceHandle = dev->get_resource_from_view(view);
+    if (resourceHandle.handle == 0)
+        return info;
+
+    const resource_desc resourceDesc = dev->get_resource_desc(resourceHandle);
+    const resource_view_desc viewDesc = dev->get_resource_view_desc(view);
+
+    info.resourceHandle = resourceHandle.handle;
+    info.width = resourceDesc.texture.width;
+    info.height = resourceDesc.texture.height;
+    info.samples = resourceDesc.texture.samples;
+    info.formatValue = static_cast<uint32_t>(
+        viewDesc.format != format::unknown ? viewDesc.format : resourceDesc.texture.format);
+    info.valid = true;
+    return info;
+}
+
+static bool sameRenderTargetFHX(const FHXRenderTargetInfo &a, const FHXRenderTargetInfo &b)
+{
+    return a.valid && b.valid &&
+           a.viewHandle == b.viewHandle &&
+           a.resourceHandle == b.resourceHandle &&
+           a.width == b.width &&
+           a.height == b.height &&
+           a.formatValue == b.formatValue;
+}
+
+static uint32_t getRenderTargetIdFHX(const FHXRenderTargetInfo &info)
+{
+    if (!info.valid)
+        return 0;
+
+    for (size_t i = 0; i < g_fhxCurrentRTCatalog.size(); ++i)
+        if (sameRenderTargetFHX(g_fhxCurrentRTCatalog[i], info))
+            return static_cast<uint32_t>(i + 1);
+
+    g_fhxCurrentRTCatalog.push_back(info);
+    return static_cast<uint32_t>(g_fhxCurrentRTCatalog.size());
+}
+
+static void rememberShaderRenderTargetFHX(FHXShaderFrameStat &stat, uint32_t rtId)
+{
+    if (rtId == 0)
+        return;
+
+    for (uint32_t i = 0; i < stat.rtCount; ++i)
+        if (stat.rtIds[i] == rtId)
+            return;
+
+    if (stat.rtCount < 4)
+        stat.rtIds[stat.rtCount++] = rtId;
+    else
+        stat.rtOverflow = true;
+}
+
 static void onBeginRenderPassFHX(command_list *commandList,
-                                 uint32_t,
-                                 const render_pass_render_target_desc *,
+                                 uint32_t count,
+                                 const render_pass_render_target_desc *rts,
                                  const render_pass_depth_stencil_desc *)
 {
     if (commandList == nullptr)
         return;
 
+    const FHXRenderTargetInfo rt =
+        (count != 0 && rts != nullptr) ? inspectRenderTargetFHX(commandList, rts[0].view) : FHXRenderTargetInfo {};
+
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass[commandList] = ++g_fhxNextRenderPass;
+    g_fhxCurrentRenderTarget[commandList] = rt;
 }
 
 static void onEndRenderPassFHX(command_list *commandList)
@@ -658,6 +763,22 @@ static void onEndRenderPassFHX(command_list *commandList)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass[commandList] = 0;
+    g_fhxCurrentRenderTarget[commandList] = FHXRenderTargetInfo {};
+}
+
+static void onBindRenderTargetsFHX(command_list *commandList,
+                                   uint32_t count,
+                                   const resource_view *rtvs,
+                                   resource_view)
+{
+    if (commandList == nullptr)
+        return;
+
+    const FHXRenderTargetInfo rt =
+        (count != 0 && rtvs != nullptr) ? inspectRenderTargetFHX(commandList, rtvs[0]) : FHXRenderTargetInfo {};
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxCurrentRenderTarget[commandList] = rt;
 }
 
 static void onResetCommandListFHX(command_list *commandList)
@@ -667,6 +788,7 @@ static void onResetCommandListFHX(command_list *commandList)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass.erase(commandList);
+    g_fhxCurrentRenderTarget.erase(commandList);
 }
 
 static void onDestroyCommandListFHX(command_list *commandList)
@@ -676,6 +798,7 @@ static void onDestroyCommandListFHX(command_list *commandList)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass.erase(commandList);
+    g_fhxCurrentRenderTarget.erase(commandList);
 }
 
 static void profileCurrentDrawFHX(command_list *commandList)
@@ -694,14 +817,23 @@ static void profileCurrentDrawFHX(command_list *commandList)
     const auto passIt = g_fhxActiveRenderPass.find(commandList);
     const uint32_t passIndex = (passIt != g_fhxActiveRenderPass.end()) ? passIt->second : 0;
 
+    FHXRenderTargetInfo rt;
+    const auto rtIt = g_fhxCurrentRenderTarget.find(commandList);
+    if (rtIt != g_fhxCurrentRenderTarget.end())
+        rt = rtIt->second;
+    const uint32_t rtId = getRenderTargetIdFHX(rt);
+
     FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
     if (stat.count == 0) {
         stat.firstDraw = drawIndex;
         stat.firstPass = passIndex;
+        stat.firstRT = rtId;
     }
 
     stat.lastDraw = drawIndex;
     stat.lastPass = passIndex;
+    stat.lastRT = rtId;
+    rememberShaderRenderTargetFHX(stat, rtId);
     ++stat.count;
 }
 
@@ -711,10 +843,12 @@ static void onReshadePresentFHX(effect_runtime *)
 
     if (!g_fhxFreezeProfiler) {
         g_fhxLastPixelFrame = g_fhxCurrentPixelFrame;
+        g_fhxLastRTCatalog = g_fhxCurrentRTCatalog;
         ++g_fhxProfiledFrame;
     }
 
     g_fhxCurrentPixelFrame.clear();
+    g_fhxCurrentRTCatalog.clear();
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
 }
@@ -795,6 +929,7 @@ static void displayFHXHuntOverlay(effect_runtime *)
     std::vector<uint32_t> pixelHashes;
     std::vector<uint32_t> vertexHashes;
     std::vector<std::pair<uint32_t, FHXShaderFrameStat>> frameStats;
+    std::vector<FHXRenderTargetInfo> rtCatalog;
     size_t computeCount = 0;
     uint64_t profiledFrame = 0;
 
@@ -806,6 +941,7 @@ static void displayFHXHuntOverlay(effect_runtime *)
         frameStats.reserve(g_fhxLastPixelFrame.size());
         for (const auto &entry : g_fhxLastPixelFrame)
             frameStats.push_back(entry);
+        rtCatalog = g_fhxLastRTCatalog;
         profiledFrame = g_fhxProfiledFrame;
     }
 
@@ -867,7 +1003,7 @@ static void displayFHXHuntOverlay(effect_runtime *)
     ImGui::TextUnformatted("Per-frame draw / render-pass profiler");
     ImGui::Checkbox("Freeze profiler snapshot", &g_fhxFreezeProfiler);
     ImGui::Text("Snapshot frame: %llu", static_cast<unsigned long long>(profiledFrame));
-    ImGui::TextUnformatted("Hash        First   Last    Count   P1   Pn   Note");
+    ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
 
     for (const auto &[hash, stat] : frameStats) {
         const char *note = "";
@@ -881,14 +1017,35 @@ static void displayFHXHuntOverlay(effect_runtime *)
             default: break;
         }
 
-        ImGui::Text("0x%08X  %6llu  %6llu  %6u  %3u  %3u  %s",
+        ImGui::Text("0x%08X  %5llu  %5llu  %5u  %2u  %2u  %2u  %2u  %2u%s  %s",
                     hash,
                     static_cast<unsigned long long>(stat.firstDraw),
                     static_cast<unsigned long long>(stat.lastDraw),
                     stat.count,
                     stat.firstPass,
                     stat.lastPass,
+                    stat.firstRT,
+                    stat.lastRT,
+                    stat.rtCount,
+                    stat.rtOverflow ? "+" : " ",
                     note);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Render-target catalog for frozen frame");
+    ImGui::TextUnformatted("ID   View/Resource handles           Size       Fmt  Samples  Format");
+    for (size_t i = 0; i < rtCatalog.size(); ++i) {
+        const FHXRenderTargetInfo &rt = rtCatalog[i];
+        ImGui::Text("%2u   %08llX/%08llX  %4ux%-4u  %3u     %u    %s",
+                    static_cast<unsigned>(i + 1),
+                    static_cast<unsigned long long>(rt.viewHandle),
+                    static_cast<unsigned long long>(rt.resourceHandle),
+                    rt.width,
+                    rt.height,
+                    rt.formatValue,
+                    static_cast<unsigned>(rt.samples),
+                    fhxFormatName(rt.formatValue));
     }
 
     ImGui::Spacing();
@@ -905,10 +1062,10 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "Diagnostic mode only. No ReShade effect injection is performed. This build only "
-        "records shader draw order and the render-pass index active at each draw; resource, "
-        "descriptor, render-target, texture-binding, constant-copy and REST effect systems "
-        "remain disabled.");
+        "Diagnostic mode only. No ReShade effect injection is performed. This build records "
+        "shader draw order, render-pass index and the first bound color render target (view, "
+        "resource, size and format). Descriptor, texture-binding, constant-copy and REST effect "
+        "systems remain disabled.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
@@ -931,6 +1088,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
             reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
             reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
 
@@ -950,6 +1108,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::unregister_event<reshade::addon_event::draw>(onDrawFHX);
             reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
             reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
+            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
