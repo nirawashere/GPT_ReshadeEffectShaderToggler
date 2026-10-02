@@ -52,6 +52,7 @@
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <mutex>
 #include <imgui.h>
 #include <reshade.hpp>
 #include <set>
@@ -604,43 +605,492 @@ filesystem::path getModulePath(HMODULE module) {
     return GetModuleFileNameW(module, buf, ARRAYSIZE(buf)) ? buf : filesystem::path();
 }
 
-// FHX Restoration / 32-bit DXVK/Vulkan diagnostic safe mode.
-// This first-stage build deliberately avoids REST's resource, descriptor,
-// render-target and effect-runtime interception during process startup.
-// It only registers the add-on, tracks created shader pipelines, and exposes
-// a tiny ReShade settings panel so we can prove the x86 Vulkan path is stable
-// before re-enabling REST functionality incrementally.
-static void displayFHXSafeSettings(effect_runtime*) {
-    ImGui::TextUnformatted("REST FHX Safe Mode");
-    ImGui::Separator();
-    ImGui::Text("Pixel shaders discovered: %zu", g_pixelShaderManager.getShaderCount());
-    ImGui::Text("Vertex shaders discovered: %zu", g_vertexShaderManager.getShaderCount());
-    ImGui::Text("Compute shaders discovered: %zu", g_computeShaderManager.getShaderCount());
-    ImGui::Spacing();
-    ImGui::TextWrapped("Diagnostic build: resource/descriptor/render-target hooks are disabled. FHX x86 Vulkan test build.");
+// FHX Restoration / 32-bit DXVK/Vulkan diagnostic mode.
+// Keeps upstream REST resource/descriptor/constant systems disabled. Adds a
+// draw-order profiler and an OPTIONAL one-shot mid-frame ReShade injection test.
+static std::mutex g_fhxMutex;
+static std::unordered_set<uint32_t> g_fhxSeenPixelShaders;
+static std::unordered_set<uint32_t> g_fhxSeenVertexShaders;
+static std::unordered_set<uint32_t> g_fhxSeenComputeShaders;
+
+static uint32_t g_fhxSelectedPixelHash = 0;
+static uint32_t g_fhxSelectedVertexHash = 0;
+static bool g_fhxBlockSelectedPixel = false;
+static bool g_fhxBlockSelectedVertex = false;
+
+struct FHXShaderFrameStat {
+    uint64_t firstDraw = 0;
+    uint64_t lastDraw = 0;
+    uint32_t count = 0;
+};
+
+enum class FHXInjectStatus : uint32_t {
+    disabled,
+    waiting,
+    no_runtime,
+    effects_disabled,
+    no_rtv,
+    bad_resource,
+    size_mismatch,
+    injected
+};
+
+static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxCurrentPixelFrame;
+static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxLastPixelFrame;
+static std::unordered_map<command_list *, resource_view> g_fhxCurrentRTV;
+static effect_runtime *g_fhxRuntime = nullptr;
+static uint64_t g_fhxCurrentDrawIndex = 0;
+static uint64_t g_fhxProfiledFrame = 0;
+static bool g_fhxFreezeProfiler = false;
+
+static bool g_fhxInjectionEnabled = false;
+static uint32_t g_fhxInjectionTrigger = 0xCF49F7D6u;
+static bool g_fhxInjectedThisFrame = false;
+static uint64_t g_fhxInjectionCount = 0;
+static FHXInjectStatus g_fhxInjectStatus = FHXInjectStatus::disabled;
+static thread_local bool g_fhxInsideEffectRender = false;
+
+static const char *fhxInjectStatusText(FHXInjectStatus status)
+{
+    switch (status) {
+        case FHXInjectStatus::disabled: return "disabled";
+        case FHXInjectStatus::waiting: return "waiting for trigger";
+        case FHXInjectStatus::no_runtime: return "trigger hit: no effect runtime";
+        case FHXInjectStatus::effects_disabled: return "trigger hit: ReShade effects disabled";
+        case FHXInjectStatus::no_rtv: return "trigger hit: no active render target";
+        case FHXInjectStatus::bad_resource: return "trigger hit: render target resource unavailable";
+        case FHXInjectStatus::size_mismatch: return "trigger hit: render target is not output-sized";
+        case FHXInjectStatus::injected: return "ReShade injected before trigger shader";
+        default: return "unknown";
+    }
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
+static void onBindPipelineFHX(command_list *commandList, pipeline_stage stages, pipeline pipelineHandle)
+{
+    if (g_fhxInsideEffectRender || commandList == nullptr || pipelineHandle.handle == 0)
+        return;
+
+    CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
+
+    uint32_t pixelHash = 0;
+    uint32_t vertexHash = 0;
+    uint32_t computeHash = 0;
+
+    if ((uint32_t)(stages & pipeline_stage::pixel_shader))
+        pixelHash = g_pixelShaderManager.safeGetShaderHash(pipelineHandle.handle);
+    if ((uint32_t)(stages & pipeline_stage::vertex_shader))
+        vertexHash = g_vertexShaderManager.safeGetShaderHash(pipelineHandle.handle);
+    if ((uint32_t)(stages & pipeline_stage::compute_shader))
+        computeHash = g_computeShaderManager.safeGetShaderHash(pipelineHandle.handle);
+
+    if (pixelHash != 0)
+        data.ps.activeShaderHash = pixelHash;
+    if (vertexHash != 0)
+        data.vs.activeShaderHash = vertexHash;
+    if (computeHash != 0)
+        data.cs.activeShaderHash = computeHash;
+
+    if (pixelHash == 0 && vertexHash == 0 && computeHash == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+    if (pixelHash != 0)
+        g_fhxSeenPixelShaders.insert(pixelHash);
+    if (vertexHash != 0)
+        g_fhxSeenVertexShaders.insert(vertexHash);
+    if (computeHash != 0)
+        g_fhxSeenComputeShaders.insert(computeHash);
+}
+
+static bool shouldBlockCurrentDrawFHX(command_list *commandList)
+{
+    if (g_fhxInsideEffectRender || commandList == nullptr)
+        return false;
+
+    const CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
+
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+
+    if (g_fhxBlockSelectedPixel &&
+        g_fhxSelectedPixelHash != 0 &&
+        data.ps.activeShaderHash == g_fhxSelectedPixelHash)
+        return true;
+
+    if (g_fhxBlockSelectedVertex &&
+        g_fhxSelectedVertexHash != 0 &&
+        data.vs.activeShaderHash == g_fhxSelectedVertexHash)
+        return true;
+
+    return false;
+}
+
+static void onInitEffectRuntimeFHX(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+    g_fhxRuntime = runtime;
+}
+
+static void onDestroyEffectRuntimeFHX(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+    if (g_fhxRuntime == runtime)
+        g_fhxRuntime = nullptr;
+}
+
+static void onBindRenderTargetsFHX(command_list *cmdList, uint32_t count, const resource_view *rtvs, resource_view)
+{
+    if (g_fhxInsideEffectRender || cmdList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+    g_fhxCurrentRTV[cmdList] = (count != 0 && rtvs != nullptr) ? rtvs[0] : resource_view { 0 };
+}
+
+static void onBeginRenderPassFHX(command_list *cmdList,
+                                 uint32_t count,
+                                 const render_pass_render_target_desc *rts,
+                                 const render_pass_depth_stencil_desc *)
+{
+    if (!g_fhxInsideEffectRender && cmdList != nullptr) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxCurrentRTV[cmdList] = (count != 0 && rts != nullptr) ? rts[0].view : resource_view { 0 };
+    }
+}
+
+static void onEndRenderPassFHX(command_list *cmdList)
+{
+    if (!g_fhxInsideEffectRender && cmdList != nullptr) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxCurrentRTV[cmdList] = resource_view { 0 };
+    }
+}
+
+static void onResetCommandListFHX(command_list *cmdList)
+{
+    if (cmdList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+    g_fhxCurrentRTV.erase(cmdList);
+}
+
+static void onDestroyCommandListFHX(command_list *cmdList)
+{
+    if (cmdList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+    g_fhxCurrentRTV.erase(cmdList);
+}
+
+static void profileAndMaybeInjectFHX(command_list *cmdList)
+{
+    if (g_fhxInsideEffectRender || cmdList == nullptr)
+        return;
+
+    const CommandListDataContainer &data = cmdList->get_private_data<CommandListDataContainer>();
+    const uint32_t pixelHash = data.ps.activeShaderHash;
+    if (pixelHash == 0)
+        return;
+
+    effect_runtime *runtime = nullptr;
+    resource_view rtv = { 0 };
+    bool tryInjection = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+
+        const uint64_t drawIndex = ++g_fhxCurrentDrawIndex;
+        FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
+        if (stat.count == 0)
+            stat.firstDraw = drawIndex;
+        stat.lastDraw = drawIndex;
+        ++stat.count;
+
+        if (g_fhxInjectionEnabled && !g_fhxInjectedThisFrame && pixelHash == g_fhxInjectionTrigger) {
+            runtime = g_fhxRuntime;
+            const auto it = g_fhxCurrentRTV.find(cmdList);
+            if (it != g_fhxCurrentRTV.end())
+                rtv = it->second;
+            tryInjection = true;
+        }
+    }
+
+    if (!tryInjection)
+        return;
+
+    if (runtime == nullptr) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxInjectStatus = FHXInjectStatus::no_runtime;
+        return;
+    }
+    if (!runtime->get_effects_state()) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxInjectStatus = FHXInjectStatus::effects_disabled;
+        return;
+    }
+    if (rtv == 0) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxInjectStatus = FHXInjectStatus::no_rtv;
+        return;
+    }
+
+    device *dev = cmdList->get_device();
+    const resource target = (dev != nullptr) ? dev->get_resource_from_view(rtv) : resource { 0 };
+    if (dev == nullptr || target.handle == 0) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxInjectStatus = FHXInjectStatus::bad_resource;
+        return;
+    }
+
+    uint32_t width = 0, height = 0;
+    runtime->get_screenshot_width_and_height(&width, &height);
+    const resource_desc desc = dev->get_resource_desc(target);
+
+    if (desc.texture.width != width || desc.texture.height != height) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxInjectStatus = FHXInjectStatus::size_mismatch;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        if (g_fhxInjectedThisFrame)
+            return;
+        g_fhxInjectedThisFrame = true;
+        ++g_fhxInjectionCount;
+        g_fhxInjectStatus = FHXInjectStatus::injected;
+    }
+
+    // ReShade 6.x captures/restores application API state for a mid-frame
+    // render_effects call. FHX currently presents an UNORM Vulkan target, so
+    // the same view is used for linear and sRGB in this diagnostic build.
+    g_fhxInsideEffectRender = true;
+    runtime->render_effects(cmdList, rtv, rtv);
+    g_fhxInsideEffectRender = false;
+}
+
+static bool onDrawFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, uint32_t)
+{
+    if (g_fhxInsideEffectRender)
+        return false;
+
+    profileAndMaybeInjectFHX(commandList);
+    return shouldBlockCurrentDrawFHX(commandList);
+}
+
+static bool onDrawIndexedFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
+{
+    if (g_fhxInsideEffectRender)
+        return false;
+
+    profileAndMaybeInjectFHX(commandList);
+    return shouldBlockCurrentDrawFHX(commandList);
+}
+
+static void onReshadePresentFHX(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_fhxMutex);
+
+    if (g_fhxRuntime != nullptr && runtime != g_fhxRuntime)
+        return;
+
+    if (!g_fhxFreezeProfiler) {
+        g_fhxLastPixelFrame = g_fhxCurrentPixelFrame;
+        ++g_fhxProfiledFrame;
+    }
+
+    g_fhxCurrentPixelFrame.clear();
+    g_fhxCurrentDrawIndex = 0;
+    g_fhxInjectedThisFrame = false;
+    g_fhxInjectStatus = g_fhxInjectionEnabled ? FHXInjectStatus::waiting : FHXInjectStatus::disabled;
+}
+
+static void displayFHXHuntOverlay(effect_runtime *)
+{
+    std::vector<uint32_t> pixelHashes;
+    std::vector<uint32_t> vertexHashes;
+    std::vector<std::pair<uint32_t, FHXShaderFrameStat>> frameStats;
+    size_t computeCount = 0;
+    uint64_t profiledFrame = 0;
+    uint64_t injectionCount = 0;
+    FHXInjectStatus injectStatus = FHXInjectStatus::disabled;
+
+    {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        pixelHashes.assign(g_fhxSeenPixelShaders.begin(), g_fhxSeenPixelShaders.end());
+        vertexHashes.assign(g_fhxSeenVertexShaders.begin(), g_fhxSeenVertexShaders.end());
+        computeCount = g_fhxSeenComputeShaders.size();
+        frameStats.reserve(g_fhxLastPixelFrame.size());
+        for (const auto &entry : g_fhxLastPixelFrame)
+            frameStats.push_back(entry);
+        profiledFrame = g_fhxProfiledFrame;
+        injectionCount = g_fhxInjectionCount;
+        injectStatus = g_fhxInjectStatus;
+    }
+
+    std::sort(pixelHashes.begin(), pixelHashes.end());
+    std::sort(vertexHashes.begin(), vertexHashes.end());
+    std::sort(frameStats.begin(), frameStats.end(),
+              [](const auto &a, const auto &b) { return a.second.firstDraw < b.second.firstDraw; });
+
+    auto indexOf = [](const std::vector<uint32_t> &values, uint32_t value) -> int {
+        if (values.empty() || value == 0)
+            return -1;
+        const auto it = std::lower_bound(values.begin(), values.end(), value);
+        return (it != values.end() && *it == value) ? static_cast<int>(std::distance(values.begin(), it)) : -1;
+    };
+
+    ImGui::TextUnformatted("FHX 32-bit DXVK/Vulkan Shader Hunter");
+    ImGui::Separator();
+    ImGui::Text("Seen pixel shaders: %zu", pixelHashes.size());
+    ImGui::Text("Seen vertex shaders: %zu", vertexHashes.size());
+    ImGui::Text("Seen compute shaders: %zu", computeCount);
+    ImGui::Spacing();
+
+    int pixelIndex = indexOf(pixelHashes, g_fhxSelectedPixelHash);
+    ImGui::Text("Selected pixel shader: %u (0x%08X)", g_fhxSelectedPixelHash, g_fhxSelectedPixelHash);
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%d / %zu]", pixelIndex >= 0 ? pixelIndex + 1 : 0, pixelHashes.size());
+
+    if (ImGui::Button("Previous Pixel") && !pixelHashes.empty()) {
+        const int next = pixelIndex <= 0 ? static_cast<int>(pixelHashes.size()) - 1 : pixelIndex - 1;
+        g_fhxSelectedPixelHash = pixelHashes[next];
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next Pixel") && !pixelHashes.empty()) {
+        const int next = (pixelIndex < 0 || pixelIndex + 1 >= static_cast<int>(pixelHashes.size())) ? 0 : pixelIndex + 1;
+        g_fhxSelectedPixelHash = pixelHashes[next];
+    }
+    ImGui::Checkbox("Suppress draws using selected pixel shader", &g_fhxBlockSelectedPixel);
+
+    ImGui::Spacing();
+
+    int vertexIndex = indexOf(vertexHashes, g_fhxSelectedVertexHash);
+    ImGui::Text("Selected vertex shader: %u (0x%08X)", g_fhxSelectedVertexHash, g_fhxSelectedVertexHash);
+    ImGui::SameLine();
+    ImGui::TextDisabled("[%d / %zu]", vertexIndex >= 0 ? vertexIndex + 1 : 0, vertexHashes.size());
+
+    if (ImGui::Button("Previous Vertex") && !vertexHashes.empty()) {
+        const int next = vertexIndex <= 0 ? static_cast<int>(vertexHashes.size()) - 1 : vertexIndex - 1;
+        g_fhxSelectedVertexHash = vertexHashes[next];
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Next Vertex") && !vertexHashes.empty()) {
+        const int next = (vertexIndex < 0 || vertexIndex + 1 >= static_cast<int>(vertexHashes.size())) ? 0 : vertexIndex + 1;
+        g_fhxSelectedVertexHash = vertexHashes[next];
+    }
+    ImGui::Checkbox("Suppress draws using selected vertex shader", &g_fhxBlockSelectedVertex);
+
+    ImGui::Spacing();
+    if (ImGui::Button("Use selected pixel as injection trigger") && g_fhxSelectedPixelHash != 0)
+        g_fhxInjectionTrigger = g_fhxSelectedPixelHash;
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Per-frame pixel shader order");
+    ImGui::Checkbox("Freeze profiler snapshot", &g_fhxFreezeProfiler);
+    ImGui::Text("Snapshot frame: %llu", static_cast<unsigned long long>(profiledFrame));
+    ImGui::TextUnformatted("Hash        First   Last    Count   Note");
+
+    for (const auto &[hash, stat] : frameStats) {
+        const char *note = "";
+        switch (hash) {
+            case 0xCF49F7D6u: note = "primary UI"; break;
+            case 0x30B96240u: note = "bars"; break;
+            case 0xAFB6F656u: note = "minimap"; break;
+            case 0xBBB19C94u: note = "minimap"; break;
+            case 0xDEA3862Du: note = "mixed world/UI"; break;
+            case 0x64787F0Fu: note = "post-process"; break;
+            default: break;
+        }
+
+        ImGui::Text("0x%08X  %6llu  %6llu  %6u   %s",
+                    hash,
+                    static_cast<unsigned long long>(stat.firstDraw),
+                    static_cast<unsigned long long>(stat.lastDraw),
+                    stat.count,
+                    note);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("One-shot mid-frame ReShade test");
+    ImGui::Text("Trigger hash: 0x%08X", g_fhxInjectionTrigger);
+    ImGui::Checkbox("Enable injection before trigger shader", &g_fhxInjectionEnabled);
+    ImGui::Text("Injection count: %llu", static_cast<unsigned long long>(injectionCount));
+    ImGui::Text("Status: %s", fhxInjectStatusText(injectStatus));
+    ImGui::TextWrapped(
+        "OFF by default. When enabled, ReShade is rendered once at the first output-sized draw "
+        "using the trigger pixel shader. Upstream REST resource, descriptor, texture-binding, "
+        "constant-copy and preview systems remain disabled.");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Clear observed shader list")) {
+        std::lock_guard<std::mutex> lock(g_fhxMutex);
+        g_fhxSeenPixelShaders.clear();
+        g_fhxSeenVertexShaders.clear();
+        g_fhxSeenComputeShaders.clear();
+        g_fhxSelectedPixelHash = 0;
+        g_fhxSelectedVertexHash = 0;
+        g_fhxBlockSelectedPixel = false;
+        g_fhxBlockSelectedVertex = false;
+    }
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
+{
     switch (fdwReason) {
         case DLL_PROCESS_ATTACH:
-            if (!reshade::register_addon(hModule)) {
+            if (!reshade::register_addon(hModule))
                 return FALSE;
-            }
 
             g_dllPath = getModulePath(hModule);
-            g_addonUIData.SetBasePath(g_dllPath.parent_path());
-            g_addonUIData.LoadShaderTogglerIniFile();
 
-            // Safe-mode event set. Keep startup interception to the absolute minimum.
             reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::register_overlay(nullptr, &displayFHXSafeSettings);
+
+            reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
+            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
+            reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+
+            reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntimeFHX);
+            reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntimeFHX);
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
+            reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
+            reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
+
+            reshade::register_event<reshade::addon_event::draw>(onDrawFHX);
+            reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexedFHX);
+            reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresentFHX);
+
+            reshade::register_overlay("REST FHX Debug", &displayFHXHuntOverlay);
             break;
 
         case DLL_PROCESS_DETACH:
-            reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
+            reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresentFHX);
+            reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexedFHX);
+            reshade::unregister_event<reshade::addon_event::draw>(onDrawFHX);
+
+            reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
+            reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
+            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(onBindRenderTargetsFHX);
+            reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntimeFHX);
+            reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntimeFHX);
+
+            reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
+
             reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::unregister_overlay(nullptr, &displayFHXSafeSettings);
+            reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
+            reshade::unregister_overlay("REST FHX Debug", &displayFHXHuntOverlay);
             reshade::unregister_addon(hModule);
             break;
     }
