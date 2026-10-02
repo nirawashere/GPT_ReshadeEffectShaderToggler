@@ -49,6 +49,7 @@
 #include "crc32_hash.hpp"
 #include <MinHook.h>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <functional>
@@ -688,16 +689,60 @@ static effect_runtime *g_fhxRuntime = nullptr;
 static uint32_t g_fhxOutputWidth = 0;
 static uint32_t g_fhxOutputHeight = 0;
 
-static bool g_fhxSawUiPrepassThisFrame = false;
-static uint32_t g_fhxFullResPassesAfterUiPrepass = 0;
-static uint32_t g_fhxLastCandidatePass = 0;
-static uint64_t g_fhxLastCandidateDraw = 0;
-static uint64_t g_fhxCandidateHits = 0;
+enum class FHXBoundaryAnchor : uint32_t
+{
+    bars_fullres = 0,
+    primary_ui,
+    minimap,
+    final_post,
+    count
+};
 
-static bool g_fhxArmSingleShotInjection = false;
+static constexpr uint32_t kFHXBoundaryAnchorCount = static_cast<uint32_t>(FHXBoundaryAnchor::count);
+static constexpr uint32_t kFHXBoundaryStableObservations = 3;
+static constexpr uint32_t kFHXWarmupSettledPresents = 3;
+
+struct FHXBoundaryModel
+{
+    uint32_t learnedLocalPass[kFHXBoundaryAnchorCount] = {};
+    uint32_t stableObservations[kFHXBoundaryAnchorCount] = {};
+    bool seenThisRecording[kFHXBoundaryAnchorCount] = {};
+    uint64_t observations[kFHXBoundaryAnchorCount] = {};
+    uint64_t changes[kFHXBoundaryAnchorCount] = {};
+};
+
+static std::unordered_map<command_list *, FHXBoundaryModel> g_fhxBoundaryModels;
+static std::unordered_map<command_list *, uint32_t> g_fhxLocalPassCounter;
+static std::unordered_map<command_list *, uint32_t> g_fhxActiveLocalPass;
+
+static uint32_t g_fhxSelectedBoundaryAnchor = static_cast<uint32_t>(FHXBoundaryAnchor::primary_ui);
+static uint32_t g_fhxRequestedInjectionFrames = 0;
+static uint32_t g_fhxRemainingInjectionFrames = 0;
 static bool g_fhxContinuousInjection = false;
 static bool g_fhxInjectedThisFrame = false;
+
+static bool g_fhxWarmupIssued = false;
+static bool g_fhxWarmupReady = false;
+static uint32_t g_fhxWarmupQuietPresents = 0;
+static uint32_t g_fhxWarmupWidth = 0;
+static uint32_t g_fhxWarmupHeight = 0;
+static uint32_t g_fhxWarmupFormat = 0;
+
+static uint64_t g_fhxPresentSerial = 0;
+static uint64_t g_fhxLastInjectionPresentSerial = UINT64_MAX;
 static uint64_t g_fhxInjectionCount = 0;
+static uint64_t g_fhxWarmupCount = 0;
+static uint64_t g_fhxSkippedUnstable = 0;
+static uint64_t g_fhxSkippedWrongTarget = 0;
+static uint64_t g_fhxSkippedAlreadyRendered = 0;
+static uint64_t g_fhxBoundaryChanges = 0;
+
+static uint32_t g_fhxLastCandidatePass = 0;
+static uint32_t g_fhxLastCandidateLocalPass = 0;
+static uint64_t g_fhxLastCandidateDraw = 0;
+static uint64_t g_fhxCandidateHits = 0;
+static uintptr_t g_fhxLastCandidateCommandList = 0;
+
 static FHXBoundaryInjectStatus g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
 static thread_local bool g_fhxInsideEffectRender = false;
 
@@ -705,20 +750,44 @@ static const char *fhxBoundaryStatusText(FHXBoundaryInjectStatus status)
 {
     switch (status)
     {
-        case FHXBoundaryInjectStatus::disabled: return "diagnostic only";
-        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "waiting for 256x256 UI prepass";
-        case FHXBoundaryInjectStatus::waiting_for_candidate: return "UI prepass seen; waiting for second full-resolution UNORM pass";
-        case FHXBoundaryInjectStatus::candidate_detected: return "candidate boundary detected";
-        case FHXBoundaryInjectStatus::armed: return "one-shot armed; waiting for candidate";
-        case FHXBoundaryInjectStatus::no_runtime: return "candidate hit, but no ReShade runtime";
-        case FHXBoundaryInjectStatus::effects_disabled: return "candidate hit, but ReShade effects are disabled";
-        case FHXBoundaryInjectStatus::bad_target: return "candidate hit, but target validation failed";
-        case FHXBoundaryInjectStatus::injected: return "ReShade effects injected at safe pre-pass boundary";
+        case FHXBoundaryInjectStatus::disabled: return "idle";
+        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "learning selected boundary";
+        case FHXBoundaryInjectStatus::waiting_for_candidate: return "boundary found; stabilizing";
+        case FHXBoundaryInjectStatus::candidate_detected: return "stable boundary ready";
+        case FHXBoundaryInjectStatus::armed: return "test queued";
+        case FHXBoundaryInjectStatus::no_runtime: return "no ReShade runtime";
+        case FHXBoundaryInjectStatus::effects_disabled: return "ReShade effects disabled/loading";
+        case FHXBoundaryInjectStatus::bad_target: return "candidate target rejected";
+        case FHXBoundaryInjectStatus::injected: return "test running";
         default: return "unknown";
     }
 }
 
-static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
+static const char *fhxBoundaryAnchorName(uint32_t index)
+{
+    switch (static_cast<FHXBoundaryAnchor>(index))
+    {
+        case FHXBoundaryAnchor::bars_fullres: return "Bars/full-res 0x30B96240";
+        case FHXBoundaryAnchor::primary_ui: return "Primary UI 0xCF49F7D6";
+        case FHXBoundaryAnchor::minimap: return "Minimap 0xAFB6F656";
+        case FHXBoundaryAnchor::final_post: return "Final post 0x64787F0F";
+        default: return "Unknown";
+    }
+}
+
+static uint32_t fhxBoundaryAnchorHash(uint32_t index)
+{
+    switch (static_cast<FHXBoundaryAnchor>(index))
+    {
+        case FHXBoundaryAnchor::bars_fullres: return 0x30B96240u;
+        case FHXBoundaryAnchor::primary_ui: return 0xCF49F7D6u;
+        case FHXBoundaryAnchor::minimap: return 0xAFB6F656u;
+        case FHXBoundaryAnchor::final_post: return 0x64787F0Fu;
+        default: return 0;
+    }
+}
+
+static bool isFullResolutionMainTargetFHXX(const FHXRenderTargetInfo &rt)
 {
     if (!rt.valid || g_fhxOutputWidth == 0 || g_fhxOutputHeight == 0)
         return false;
@@ -726,6 +795,77 @@ static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
     return rt.width == g_fhxOutputWidth &&
            rt.height == g_fhxOutputHeight &&
            static_cast<reshade::api::format>(rt.formatValue) == reshade::api::format::b8g8r8a8_unorm;
+}
+
+static bool isFullResolutionFinalTargetFHX(const FHXRenderTargetInfo &rt)
+{
+    if (!rt.valid || g_fhxOutputWidth == 0 || g_fhxOutputHeight == 0)
+        return false;
+
+    const auto fmt = static_cast<reshade::api::format>(rt.formatValue);
+    return rt.width == g_fhxOutputWidth &&
+           rt.height == g_fhxOutputHeight &&
+           (fmt == reshade::api::format::b8g8r8a8_unorm_srgb ||
+            fmt == reshade::api::format::b8g8r8a8_unorm);
+}
+
+static bool isExpectedBoundaryTargetFHX(uint32_t anchorIndex, const FHXRenderTargetInfo &rt)
+{
+    return static_cast<FHXBoundaryAnchor>(anchorIndex) == FHXBoundaryAnchor::final_post
+        ? isFullResolutionFinalTargetFHX(rt)
+        : isFullResolutionMainTargetFHX(rt);
+}
+
+static void resetFHXWarmup()
+{
+    g_fhxWarmupIssued = false;
+    g_fhxWarmupReady = false;
+    g_fhxWarmupQuietPresents = 0;
+    g_fhxWarmupWidth = 0;
+    g_fhxWarmupHeight = 0;
+    g_fhxWarmupFormat = 0;
+}
+
+static bool warmupMatchesTargetFHX(const FHXRenderTargetInfo &rt)
+{
+    return g_fhxWarmupIssued &&
+           g_fhxWarmupWidth == rt.width &&
+           g_fhxWarmupHeight == rt.height &&
+           g_fhxWarmupFormat == rt.formatValue;
+}
+
+static void queueFHXInjectionTest(uint32_t frameCount)
+{
+    g_fhxRequestedInjectionFrames = frameCount;
+    g_fhxRemainingInjectionFrames = frameCount;
+    g_fhxContinuousInjection = false;
+    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
+
+    std::string msg = std::format(
+        "[REST FHX] queued test: anchor='{}', frames={}",
+        fhxBoundaryAnchorName(g_fhxSelectedBoundaryAnchor),
+        frameCount);
+    reshade::log::message(reshade::log::level::info, msg.c_str());
+}
+
+static void logFHXInjectionHeartbeat(const char *phase, command_list *commandList, uint32_t globalPass, uint32_t localPass, const FHXRenderTargetInfo &rt)
+{
+    if (g_fhxInjectionCount < 10 || (g_fhxInjectionCount % 60) == 0 || std::strcmp(phase, "warmup") == 0)
+    {
+        std::string msg = std::format(
+            "[REST FHX] {} serial={} anchor='{}' injection={} cmd=0x{:X} globalPass={} localPass={} target={}x{} fmt={}",
+            phase,
+            g_fhxPresentSerial,
+            fhxBoundaryAnchorName(g_fhxSelectedBoundaryAnchor),
+            g_fhxInjectionCount,
+            reinterpret_cast<uintptr_t>(commandList),
+            globalPass,
+            localPass,
+            rt.width,
+            rt.height,
+            rt.formatValue);
+        reshade::log::message(reshade::log::level::info, msg.c_str());
+    }
 }
 
 static const char *fhxFormatName(uint32_t value)
@@ -824,70 +964,131 @@ static void onBeginRenderPassFHX(command_list *commandList,
         (targetView.handle != 0) ? inspectRenderTargetFHX(commandList, targetView) : FHXRenderTargetInfo {};
 
     effect_runtime *runtime = nullptr;
+    bool performWarmup = false;
     bool performInjection = false;
+    uint32_t passIndex = 0;
+    uint32_t localPassIndex = 0;
 
     {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
 
-        const uint32_t passIndex = ++g_fhxNextRenderPass;
+        passIndex = ++g_fhxNextRenderPass;
+        localPassIndex = ++g_fhxLocalPassCounter[commandList];
+
         g_fhxActiveRenderPass[commandList] = passIndex;
+        g_fhxActiveLocalPass[commandList] = localPassIndex;
         g_fhxCurrentRenderTarget[commandList] = rt;
 
-        if (g_fhxSawUiPrepassThisFrame && isFullResolutionMainTargetFHX(rt)) {
-            ++g_fhxFullResPassesAfterUiPrepass;
+        auto modelIt = g_fhxBoundaryModels.find(commandList);
+        if (modelIt == g_fhxBoundaryModels.end())
+            return;
 
-            // FHX's observed sequence after the 256x256 UI prepass is:
-            //   1st full-resolution UNORM pass = late world/scene work
-            //   2nd full-resolution UNORM pass = UI begins almost immediately
-            // ReShade's begin_render_pass callback runs before vkCmdBeginRenderPass,
-            // so this is outside an active Vulkan render pass (unlike the crashed
-            // mid-draw experiment).
-            if (g_fhxFullResPassesAfterUiPrepass == 2) {
-                g_fhxLastCandidatePass = passIndex;
-                g_fhxLastCandidateDraw = g_fhxCurrentDrawIndex + 1;
-                ++g_fhxCandidateHits;
+        FHXBoundaryModel &model = modelIt->second;
+        const uint32_t anchorIndex = g_fhxSelectedBoundaryAnchor;
 
-                if (g_fhxArmSingleShotInjection || g_fhxContinuousInjection) {
-                    runtime = g_fhxRuntime;
-                    performInjection = true;
-                    g_fhxInjectedThisFrame = true;
-                    g_fhxArmSingleShotInjection = false;
-                    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-                } else {
-                    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-                }
-            }
+        const bool stableBoundary =
+            anchorIndex < kFHXBoundaryAnchorCount &&
+            model.learnedLocalPass[anchorIndex] != 0 &&
+            model.stableObservations[anchorIndex] >= kFHXBoundaryStableObservations;
+
+        if (!stableBoundary)
+        {
+            if (g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection)
+                ++g_fhxSkippedUnstable;
+            return;
         }
+
+        if (localPassIndex != model.learnedLocalPass[anchorIndex])
+            return;
+
+        ++g_fhxCandidateHits;
+        g_fhxLastCandidatePass = passIndex;
+        g_fhxLastCandidateLocalPass = localPassIndex;
+        g_fhxLastCandidateDraw = g_fhxCurrentDrawIndex + 1;
+        g_fhxLastCandidateCommandList = reinterpret_cast<uintptr_t>(commandList);
+
+        if (!isExpectedBoundaryTargetFHX(anchorIndex, rt))
+        {
+            ++g_fhxSkippedWrongTarget;
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::bad_target;
+            return;
+        }
+
+        const bool testRequested = g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection;
+        if (!testRequested)
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+            return;
+        }
+
+        if (g_fhxLastInjectionPresentSerial == g_fhxPresentSerial)
+        {
+            ++g_fhxSkippedAlreadyRendered;
+            return;
+        }
+
+        runtime = g_fhxRuntime;
+        if (runtime == nullptr)
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
+            return;
+        }
+
+        if (!warmupMatchesTargetFHX(rt))
+            resetFHXWarmup();
+
+        if (!g_fhxWarmupIssued)
+        {
+            g_fhxWarmupIssued = true;
+            g_fhxWarmupReady = false;
+            g_fhxWarmupQuietPresents = 0;
+            g_fhxWarmupWidth = rt.width;
+            g_fhxWarmupHeight = rt.height;
+            g_fhxWarmupFormat = rt.formatValue;
+            g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
+            performWarmup = true;
+        }
+        else if (!g_fhxWarmupReady)
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
+            return;
+        }
+        else
+        {
+            g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
+            g_fhxInjectedThisFrame = true;
+            performInjection = true;
+        }
+    }
+
+    if (runtime == nullptr)
+        return;
+
+    if (performWarmup)
+    {
+        logFHXInjectionHeartbeat("warmup", commandList, passIndex, localPassIndex, rt);
+        g_fhxInsideEffectRender = true;
+        runtime->render_effects(commandList, targetView, targetView);
+        g_fhxInsideEffectRender = false;
+
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        ++g_fhxWarmupCount;
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
+        return;
     }
 
     if (!performInjection)
         return;
 
-    if (runtime == nullptr) {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
-        return;
-    }
-
-    if (!runtime->get_effects_state()) {
+    if (runtime->is_loading() || !runtime->get_effects_state())
+    {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
         g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
         return;
     }
 
-    if (targetView.handle == 0 || !rt.valid || !isFullResolutionMainTargetFHX(rt)) {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::bad_target;
-        return;
-    }
+    logFHXInjectionHeartbeat("begin", commandList, passIndex, localPassIndex, rt);
 
-    // Important: This call occurs before the game's Vulkan render pass begins.
-    // The old crashing build called render_effects from a draw callback while
-    // Vulkan was already inside a render pass.
-    //
-    // FHX's main target is UNORM. Use the same compatible view for both slots in
-    // this first guarded test. The user's clean baseline has only Lumenite Kernel
-    // and DLSS5 Feed enabled.
     g_fhxInsideEffectRender = true;
     runtime->render_effects(commandList, targetView, targetView);
     g_fhxInsideEffectRender = false;
@@ -895,8 +1096,23 @@ static void onBeginRenderPassFHX(command_list *commandList,
     {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
         ++g_fhxInjectionCount;
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::injected;
+
+        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames != 0)
+            --g_fhxRemainingInjectionFrames;
+
+        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames == 0)
+        {
+            g_fhxRequestedInjectionFrames = 0;
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+            reshade::log::message(reshade::log::level::info, "[REST FHX] finite injection test complete");
+        }
+        else
+        {
+            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::injected;
+        }
     }
+
+    logFHXInjectionHeartbeat("end", commandList, passIndex, localPassIndex, rt);
 }
 
 static void onEndRenderPassFHX(command_list *commandList)
@@ -906,6 +1122,7 @@ static void onEndRenderPassFHX(command_list *commandList)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass[commandList] = 0;
+    g_fhxActiveLocalPass[commandList] = 0;
     g_fhxCurrentRenderTarget[commandList] = FHXRenderTargetInfo {};
 }
 
@@ -931,7 +1148,13 @@ static void onResetCommandListFHX(command_list *commandList)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass.erase(commandList);
+    g_fhxActiveLocalPass.erase(commandList);
+    g_fhxLocalPassCounter[commandList] = 0;
     g_fhxCurrentRenderTarget.erase(commandList);
+
+    FHXBoundaryModel &model = g_fhxBoundaryModels[commandList];
+    for (uint32_t i = 0; i < kFHXBoundaryAnchorCount; ++i)
+        model.seenThisRecording[i] = false;
 }
 
 static void onDestroyCommandListFHX(command_list *commandList)
@@ -941,6 +1164,9 @@ static void onDestroyCommandListFHX(command_list *commandList)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
     g_fhxActiveRenderPass.erase(commandList);
+    g_fhxActiveLocalPass.erase(commandList);
+    g_fhxLocalPassCounter.erase(commandList);
+    g_fhxBoundaryModels.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
 }
 
@@ -990,12 +1216,65 @@ static void profileCurrentDrawFHX(command_list *commandList)
         rt = rtIt->second;
     const uint32_t rtId = getRenderTargetIdFHX(rt);
 
-    if (pixelHash == 0x30B96240u && rt.valid && rt.width == 256 && rt.height == 256) {
-        g_fhxSawUiPrepassThisFrame = true;
-        if (g_fhxArmSingleShotInjection || g_fhxContinuousInjection)
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
-        else
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
+    // Learn each candidate boundary on the command list where that shader
+    // actually appears. This is intentionally command-list-local, because global
+    // pass numbers can interleave across Vulkan command buffers.
+    const auto localPassIt = g_fhxActiveLocalPass.find(commandList);
+    const uint32_t localPassIndex =
+        (localPassIt != g_fhxActiveLocalPass.end()) ? localPassIt->second : 0;
+
+    if (localPassIndex != 0)
+    {
+        FHXBoundaryModel &model = g_fhxBoundaryModels[commandList];
+
+        for (uint32_t anchorIndex = 0; anchorIndex < kFHXBoundaryAnchorCount; ++anchorIndex)
+        {
+            if (pixelHash != fhxBoundaryAnchorHash(anchorIndex) ||
+                model.seenThisRecording[anchorIndex] ||
+                !isExpectedBoundaryTargetFHX(anchorIndex, rt))
+                continue;
+
+            model.seenThisRecording[anchorIndex] = true;
+            ++model.observations[anchorIndex];
+
+            if (model.learnedLocalPass[anchorIndex] == localPassIndex)
+            {
+                if (model.stableObservations[anchorIndex] < 0xFFFFFFFFu)
+                    ++model.stableObservations[anchorIndex];
+            }
+            else
+            {
+                if (model.learnedLocalPass[anchorIndex] != 0)
+                {
+                    ++model.changes[anchorIndex];
+                    ++g_fhxBoundaryChanges;
+
+                    std::string msg = std::format(
+                        "[REST FHX] boundary changed: anchor='{}' cmd=0x{:X} oldLocalPass={} newLocalPass={}",
+                        fhxBoundaryAnchorName(anchorIndex),
+                        reinterpret_cast<uintptr_t>(commandList),
+                        model.learnedLocalPass[anchorIndex],
+                        localPassIndex);
+                    reshade::log::message(reshade::log::level::warning, msg.c_str());
+                }
+
+                model.learnedLocalPass[anchorIndex] = localPassIndex;
+                model.stableObservations[anchorIndex] = 1;
+            }
+
+            if (anchorIndex == g_fhxSelectedBoundaryAnchor)
+            {
+                g_fhxLastCandidatePass = passIndex;
+                g_fhxLastCandidateLocalPass = localPassIndex;
+                g_fhxLastCandidateDraw = drawIndex;
+                g_fhxLastCandidateCommandList = reinterpret_cast<uintptr_t>(commandList);
+
+                if (model.stableObservations[anchorIndex] >= kFHXBoundaryStableObservations)
+                    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+                else
+                    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
+            }
+        }
     }
 
     FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
@@ -1035,6 +1314,8 @@ static void onReshadePresentFHX(effect_runtime *runtime)
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
 
+    ++g_fhxPresentSerial;
+
     if (runtime != nullptr) {
         g_fhxRuntime = runtime;
         g_fhxOutputWidth = width;
@@ -1048,21 +1329,41 @@ static void onReshadePresentFHX(effect_runtime *runtime)
         ++g_fhxProfiledFrame;
     }
 
+    // A custom-target render can cause ReShade to create and asynchronously
+    // compile a new effect permutation. Treat that first render as warm-up only
+    // and do not start the requested test until loading is finished and several
+    // clean presents have elapsed.
+    if (g_fhxWarmupIssued && !g_fhxWarmupReady)
+    {
+        if (runtime != nullptr && runtime->is_loading())
+        {
+            g_fhxWarmupQuietPresents = 0;
+        }
+        else
+        {
+            if (g_fhxWarmupQuietPresents < kFHXWarmupSettledPresents)
+                ++g_fhxWarmupQuietPresents;
+
+            if (g_fhxWarmupQuietPresents >= kFHXWarmupSettledPresents)
+            {
+                g_fhxWarmupReady = true;
+                reshade::log::message(reshade::log::level::info, "[REST FHX] custom-target permutation warm-up settled; requested test may begin");
+            }
+        }
+    }
+
     g_fhxCurrentPixelFrame.clear();
     g_fhxCurrentShaderRTFrame.clear();
     g_fhxCurrentRTCatalog.clear();
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
-    g_fhxSawUiPrepassThisFrame = false;
-    g_fhxFullResPassesAfterUiPrepass = 0;
     g_fhxInjectedThisFrame = false;
 
-    if (g_fhxArmSingleShotInjection)
+    const bool testRequested = g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection;
+    if (testRequested)
         g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
-    else if (g_fhxContinuousInjection)
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_ui_prepass;
-    else
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
+    else if (g_fhxBoundaryInjectStatus == FHXBoundaryInjectStatus::injected)
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
 }
 
 static void onBindPipelineFHX(command_list *commandList, pipeline_stage stages, pipeline pipelineHandle)
@@ -1228,27 +1529,112 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::TextUnformatted("Safe pre-UI boundary detector / injection test");
+    ImGui::TextUnformatted("FHX multi-boundary injection test harness");
     ImGui::Text("Output size: %ux%u", g_fhxOutputWidth, g_fhxOutputHeight);
-    ImGui::Text("Last candidate: pass %u, before draw %llu",
-                g_fhxLastCandidatePass,
-                static_cast<unsigned long long>(g_fhxLastCandidateDraw));
-    ImGui::Text("Candidate hits: %llu", static_cast<unsigned long long>(g_fhxCandidateHits));
-    ImGui::Text("Injection count: %llu", static_cast<unsigned long long>(g_fhxInjectionCount));
-    ImGui::Text("Status: %s", fhxBoundaryStatusText(g_fhxBoundaryInjectStatus));
 
-    if (ImGui::Button("Arm ONE-SHOT boundary injection")) {
+    const char *anchorItems[] = {
+        "Bars/full-res 0x30B96240",
+        "Primary UI 0xCF49F7D6",
+        "Minimap 0xAFB6F656",
+        "Final post 0x64787F0F"
+    };
+
+    int selectedAnchor = static_cast<int>(g_fhxSelectedBoundaryAnchor);
+    if (ImGui::Combo("Boundary anchor", &selectedAnchor, anchorItems, 4))
+    {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxArmSingleShotInjection = true;
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
+        g_fhxSelectedBoundaryAnchor = static_cast<uint32_t>(selectedAnchor);
+        g_fhxRequestedInjectionFrames = 0;
+        g_fhxRemainingInjectionFrames = 0;
+        g_fhxContinuousInjection = false;
+        resetFHXWarmup();
+        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_ui_prepass;
     }
 
-    ImGui::Checkbox("Continuous boundary injection (only after one-shot succeeds)", &g_fhxContinuousInjection);
+    uint32_t readyModels = 0;
+    uint32_t totalModels = 0;
+    for (const auto &entry : g_fhxBoundaryModels)
+    {
+        const FHXBoundaryModel &model = entry.second;
+        ++totalModels;
+        if (model.learnedLocalPass[g_fhxSelectedBoundaryAnchor] != 0 &&
+            model.stableObservations[g_fhxSelectedBoundaryAnchor] >= kFHXBoundaryStableObservations)
+            ++readyModels;
+    }
+
+    ImGui::Text("Boundary models ready: %u / %u command lists", readyModels, totalModels);
+    ImGui::Text("Last anchor observation: cmd 0x%llX, global pass %u, local pass %u, draw %llu",
+                static_cast<unsigned long long>(g_fhxLastCandidateCommandList),
+                g_fhxLastCandidatePass,
+                g_fhxLastCandidateLocalPass,
+                static_cast<unsigned long long>(g_fhxLastCandidateDraw));
+    ImGui::Text("Status: %s", fhxBoundaryStatusText(g_fhxBoundaryInjectStatus));
+
+    ImGui::Text("Warm-up: %s | quiet presents %u/%u | warmups %llu",
+                g_fhxWarmupReady ? "READY" : (g_fhxWarmupIssued ? "WAITING" : "NOT STARTED"),
+                g_fhxWarmupQuietPresents,
+                kFHXWarmupSettledPresents,
+                static_cast<unsigned long long>(g_fhxWarmupCount));
+
+    ImGui::Text("Requested/remaining finite injections: %u / %u",
+                g_fhxRequestedInjectionFrames,
+                g_fhxRemainingInjectionFrames);
+    ImGui::Text("Completed injections: %llu | present serial: %llu",
+                static_cast<unsigned long long>(g_fhxInjectionCount),
+                static_cast<unsigned long long>(g_fhxPresentSerial));
+
+    if (ImGui::Button("Test 1 frame"))
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        queueFHXInjectionTest(1);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Test 120 frames"))
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        queueFHXInjectionTest(120);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Test 600 frames"))
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        queueFHXInjectionTest(600);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Test 3600 frames"))
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        queueFHXInjectionTest(3600);
+    }
+
+    if (ImGui::Checkbox("Continuous injection", &g_fhxContinuousInjection))
+    {
+        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+        g_fhxRequestedInjectionFrames = 0;
+        g_fhxRemainingInjectionFrames = 0;
+        g_fhxBoundaryInjectStatus = g_fhxContinuousInjection
+            ? FHXBoundaryInjectStatus::armed
+            : FHXBoundaryInjectStatus::candidate_detected;
+
+        reshade::log::message(
+            reshade::log::level::info,
+            g_fhxContinuousInjection ? "[REST FHX] continuous test enabled" : "[REST FHX] continuous test disabled");
+    }
+
+    ImGui::Text("Skipped: unstable=%llu wrong-target=%llu already-rendered=%llu | boundary changes=%llu",
+                static_cast<unsigned long long>(g_fhxSkippedUnstable),
+                static_cast<unsigned long long>(g_fhxSkippedWrongTarget),
+                static_cast<unsigned long long>(g_fhxSkippedAlreadyRendered),
+                static_cast<unsigned long long>(g_fhxBoundaryChanges));
+
     ImGui::TextWrapped(
-        "Candidate logic: observe the known 256x256 bars/UI prepass (0x30B96240), then select "
-        "the second output-sized BGRA8_UNORM render pass. ReShade injection, when armed, occurs "
-        "from begin_render_pass BEFORE Vulkan enters that pass. This deliberately avoids the "
-        "mid-draw path that crashed nvoglv32.dll.");
+        "Each Vulkan command list learns the LOCAL pass containing the selected verified shader. "
+        "A boundary must repeat at least 3 times on that command list before it is trusted. "
+        "The first custom-target ReShade render is treated only as a permutation warm-up; the "
+        "actual test waits until ReShade stops loading and 3 additional presents pass. "
+        "Injection remains in begin_render_pass, before the game's Vulkan render pass begins. "
+        "Use Final post as a control: if it is stable while earlier anchors flicker, boundary "
+        "timing is the problem rather than the custom render_effects call itself.");
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
@@ -1325,10 +1711,11 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "Profiler remains diagnostic by default. Optional injection is OFF unless manually armed. "
-        "The guarded test invokes ReShade only at the detected pre-UI begin_render_pass boundary, "
-        "before Vulkan enters the render pass. Descriptor, texture-binding, constant-copy and full "
-        "upstream REST systems remain disabled.");
+        "Multi-boundary FHX diagnostic harness. Injection is OFF until a finite or continuous test "
+        "is selected. Candidate boundaries are learned per Vulkan command list/local pass from four "
+        "verified shader anchors, with automatic custom-target permutation warm-up before real test "
+        "frames. Injection remains in begin_render_pass before Vulkan enters the game render pass. "
+        "Descriptor, texture-binding, constant-copy and full upstream REST systems remain disabled.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
