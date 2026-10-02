@@ -622,6 +622,103 @@ static uint32_t g_fhxSelectedVertexHash = 0;
 static bool g_fhxBlockSelectedPixel = false;
 static bool g_fhxBlockSelectedVertex = false;
 
+struct FHXShaderFrameStat
+{
+    uint64_t firstDraw = 0;
+    uint64_t lastDraw = 0;
+    uint32_t count = 0;
+    uint32_t firstPass = 0;
+    uint32_t lastPass = 0;
+};
+
+static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxCurrentPixelFrame;
+static std::unordered_map<uint32_t, FHXShaderFrameStat> g_fhxLastPixelFrame;
+static std::unordered_map<command_list *, uint32_t> g_fhxActiveRenderPass;
+static uint64_t g_fhxCurrentDrawIndex = 0;
+static uint64_t g_fhxProfiledFrame = 0;
+static uint32_t g_fhxNextRenderPass = 0;
+static bool g_fhxFreezeProfiler = false;
+
+static void onBeginRenderPassFHX(command_list *commandList,
+                                 uint32_t,
+                                 const render_pass_render_target_desc *,
+                                 const render_pass_depth_stencil_desc *)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass[commandList] = ++g_fhxNextRenderPass;
+}
+
+static void onEndRenderPassFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass[commandList] = 0;
+}
+
+static void onResetCommandListFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass.erase(commandList);
+}
+
+static void onDestroyCommandListFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    g_fhxActiveRenderPass.erase(commandList);
+}
+
+static void profileCurrentDrawFHX(command_list *commandList)
+{
+    if (commandList == nullptr)
+        return;
+
+    const CommandListDataContainer &data = commandList->get_private_data<CommandListDataContainer>();
+    const uint32_t pixelHash = data.ps.activeShaderHash;
+    if (pixelHash == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    const uint64_t drawIndex = ++g_fhxCurrentDrawIndex;
+    const auto passIt = g_fhxActiveRenderPass.find(commandList);
+    const uint32_t passIndex = (passIt != g_fhxActiveRenderPass.end()) ? passIt->second : 0;
+
+    FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
+    if (stat.count == 0) {
+        stat.firstDraw = drawIndex;
+        stat.firstPass = passIndex;
+    }
+
+    stat.lastDraw = drawIndex;
+    stat.lastPass = passIndex;
+    ++stat.count;
+}
+
+static void onReshadePresentFHX(effect_runtime *)
+{
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    if (!g_fhxFreezeProfiler) {
+        g_fhxLastPixelFrame = g_fhxCurrentPixelFrame;
+        ++g_fhxProfiledFrame;
+    }
+
+    g_fhxCurrentPixelFrame.clear();
+    g_fhxCurrentDrawIndex = 0;
+    g_fhxNextRenderPass = 0;
+}
+
 static void onBindPipelineFHX(command_list *commandList, pipeline_stage stages, pipeline pipelineHandle)
 {
     if (commandList == nullptr || pipelineHandle.handle == 0)
@@ -683,11 +780,13 @@ static bool shouldBlockCurrentDrawFHX(command_list *commandList)
 
 static bool onDrawFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, uint32_t)
 {
+    profileCurrentDrawFHX(commandList);
     return shouldBlockCurrentDrawFHX(commandList);
 }
 
 static bool onDrawIndexedFHX(command_list *commandList, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
 {
+    profileCurrentDrawFHX(commandList);
     return shouldBlockCurrentDrawFHX(commandList);
 }
 
@@ -695,17 +794,25 @@ static void displayFHXHuntOverlay(effect_runtime *)
 {
     std::vector<uint32_t> pixelHashes;
     std::vector<uint32_t> vertexHashes;
+    std::vector<std::pair<uint32_t, FHXShaderFrameStat>> frameStats;
     size_t computeCount = 0;
+    uint64_t profiledFrame = 0;
 
     {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
         pixelHashes.assign(g_fhxSeenPixelShaders.begin(), g_fhxSeenPixelShaders.end());
         vertexHashes.assign(g_fhxSeenVertexShaders.begin(), g_fhxSeenVertexShaders.end());
         computeCount = g_fhxSeenComputeShaders.size();
+        frameStats.reserve(g_fhxLastPixelFrame.size());
+        for (const auto &entry : g_fhxLastPixelFrame)
+            frameStats.push_back(entry);
+        profiledFrame = g_fhxProfiledFrame;
     }
 
     std::sort(pixelHashes.begin(), pixelHashes.end());
     std::sort(vertexHashes.begin(), vertexHashes.end());
+    std::sort(frameStats.begin(), frameStats.end(),
+              [](const auto &a, const auto &b) { return a.second.firstDraw < b.second.firstDraw; });
 
     auto indexOf = [](const std::vector<uint32_t> &values, uint32_t value) -> int {
         if (values.empty() || value == 0)
@@ -756,6 +863,35 @@ static void displayFHXHuntOverlay(effect_runtime *)
     ImGui::Checkbox("Suppress draws using selected vertex shader", &g_fhxBlockSelectedVertex);
 
     ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Per-frame draw / render-pass profiler");
+    ImGui::Checkbox("Freeze profiler snapshot", &g_fhxFreezeProfiler);
+    ImGui::Text("Snapshot frame: %llu", static_cast<unsigned long long>(profiledFrame));
+    ImGui::TextUnformatted("Hash        First   Last    Count   P1   Pn   Note");
+
+    for (const auto &[hash, stat] : frameStats) {
+        const char *note = "";
+        switch (hash) {
+            case 0xCF49F7D6u: note = "primary UI"; break;
+            case 0x30B96240u: note = "bars"; break;
+            case 0xAFB6F656u: note = "minimap"; break;
+            case 0xBBB19C94u: note = "minimap"; break;
+            case 0xDEA3862Du: note = "mixed world/UI"; break;
+            case 0x64787F0Fu: note = "post-process"; break;
+            default: break;
+        }
+
+        ImGui::Text("0x%08X  %6llu  %6llu  %6u  %3u  %3u  %s",
+                    hash,
+                    static_cast<unsigned long long>(stat.firstDraw),
+                    static_cast<unsigned long long>(stat.lastDraw),
+                    stat.count,
+                    stat.firstPass,
+                    stat.lastPass,
+                    note);
+    }
+
+    ImGui::Spacing();
     if (ImGui::Button("Clear observed shader list")) {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
         g_fhxSeenPixelShaders.clear();
@@ -769,8 +905,10 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "Diagnostic mode only. Resource, descriptor, render-target, texture-binding, "
-        "constant-copy and REST effect-injection hooks remain disabled.");
+        "Diagnostic mode only. No ReShade effect injection is performed. This build only "
+        "records shader draw order and the render-pass index active at each draw; resource, "
+        "descriptor, render-target, texture-binding, constant-copy and REST effect systems "
+        "remain disabled.");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
@@ -789,22 +927,33 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             // Minimal command-list state needed for shader hunting.
             reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
             reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
+            reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
 
-            // Draw suppression is the only rendering modification in this build.
+            // Draw suppression is still the only rendering modification in this build.
+            // The additional callbacks only record render-pass timing.
             reshade::register_event<reshade::addon_event::draw>(onDrawFHX);
             reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexedFHX);
+            reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresentFHX);
 
             // Give this build an explicit named overlay tab.
             reshade::register_overlay("REST FHX Debug", &displayFHXHuntOverlay);
             break;
 
         case DLL_PROCESS_DETACH:
+            reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresentFHX);
             reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexedFHX);
             reshade::unregister_event<reshade::addon_event::draw>(onDrawFHX);
+            reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPassFHX);
+            reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPassFHX);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
             reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
             reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
             reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
