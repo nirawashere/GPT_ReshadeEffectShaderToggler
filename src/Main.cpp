@@ -660,15 +660,15 @@ static bool g_fhxFreezeProfiler = false;
 
 static const char *fhxFormatName(uint32_t value)
 {
-    switch (static_cast<format>(value))
+    switch (static_cast<reshade::api::format>(value))
     {
-        case format::r8g8b8a8_unorm: return "RGBA8_UNORM";
-        case format::r8g8b8a8_unorm_srgb: return "RGBA8_SRGB";
-        case format::b8g8r8a8_unorm: return "BGRA8_UNORM";
-        case format::b8g8r8a8_unorm_srgb: return "BGRA8_SRGB";
-        case format::r10g10b10a2_unorm: return "RGB10A2_UNORM";
-        case format::r11g11b10_float: return "R11G11B10_FLOAT";
-        case format::r16g16b16a16_float: return "RGBA16_FLOAT";
+        case reshade::api::format::r8g8b8a8_unorm: return "RGBA8_UNORM";
+        case reshade::api::format::r8g8b8a8_unorm_srgb: return "RGBA8_SRGB";
+        case reshade::api::format::b8g8r8a8_unorm: return "BGRA8_UNORM";
+        case reshade::api::format::b8g8r8a8_unorm_srgb: return "BGRA8_SRGB";
+        case reshade::api::format::r10g10b10a2_unorm: return "RGB10A2_UNORM";
+        case reshade::api::format::r11g11b10_float: return "R11G11B10_FLOAT";
+        case reshade::api::format::r16g16b16a16_float: return "RGBA16_FLOAT";
         default: return "other";
     }
 }
