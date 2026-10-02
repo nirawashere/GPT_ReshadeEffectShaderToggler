@@ -746,28 +746,23 @@ static void onBindRenderTargetsFHX(command_list *cmdList, uint32_t count, const 
     g_fhxCurrentRTV[cmdList] = (count != 0 && rtvs != nullptr) ? rtvs[0] : resource_view { 0 };
 }
 
-static bool onBeginRenderPassFHX(command_list *cmdList,
+static void onBeginRenderPassFHX(command_list *cmdList,
                                  uint32_t count,
                                  const render_pass_render_target_desc *rts,
-                                 const render_pass_depth_stencil_desc *,
-                                 render_pass_flags)
+                                 const render_pass_depth_stencil_desc *)
 {
     if (!g_fhxInsideEffectRender && cmdList != nullptr) {
         std::lock_guard<std::mutex> lock(g_fhxMutex);
         g_fhxCurrentRTV[cmdList] = (count != 0 && rts != nullptr) ? rts[0].view : resource_view { 0 };
     }
-
-    return false;
 }
 
-static bool onEndRenderPassFHX(command_list *cmdList)
+static void onEndRenderPassFHX(command_list *cmdList)
 {
     if (!g_fhxInsideEffectRender && cmdList != nullptr) {
         std::lock_guard<std::mutex> lock(g_fhxMutex);
         g_fhxCurrentRTV[cmdList] = resource_view { 0 };
     }
-
-    return false;
 }
 
 static void onResetCommandListFHX(command_list *cmdList)
