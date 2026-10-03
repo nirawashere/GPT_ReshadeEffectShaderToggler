@@ -1,646 +1,485 @@
-///////////////////////////////////////////////////////////////////////
-//
-// Part of ShaderToggler, a shader toggler add on for Reshade 5+ which allows you
-// to define groups of shaders to toggle them on/off with one key press
-//
-// (c) Frans 'Otis_Inf' Bouma.
-//
-// All rights reserved.
-// https://github.com/FransBouma/ShaderToggler
-//
-// Redistribution and use in source and binary forms, with or without
-// modification, are permitted provided that the following conditions are met :
-//
-//  * Redistributions of source code must retain the above copyright notice, this
-//	  list of conditions and the following disclaimer.
-//
-//  * Redistributions in binary form must reproduce the above copyright notice,
-//    this list of conditions and the following disclaimer in the documentation
-//    and / or other materials provided with the distribution.
-//
-// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-// DISCLAIMED.IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-// FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-// DAMAGES(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-// CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-// OR TORT(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-/////////////////////////////////////////////////////////////////////////
-#include "AddonUIData.h"
-#include "AddonUIDisplay.h"
-#include "CDataFile.h"
-#include "ConstantManager.h"
-#include "KeyMonitor.h"
-#include "PipelinePrivateData.h"
-#include "RenderingBindingManager.h"
-#include "RenderingEffectManager.h"
-#include "RenderingManager.h"
-#include "RenderingPreviewManager.h"
-#include "RenderingQueueManager.h"
-#include "RenderingShaderManager.h"
-#include "ResourceManager.h"
-#include "ShaderManager.h"
-#include "StateTracking.h"
-#include "TechniqueManager.h"
-#include "ToggleGroup.h"
 #include "crc32_hash.hpp"
-#include <MinHook.h>
-#include <chrono>
-#include <filesystem>
-#include <format>
-#include <functional>
+
+#include <Windows.h>
 #include <imgui.h>
 #include <reshade.hpp>
-#include <set>
-#include <tuple>
+
+#include <cstdint>
+#include <mutex>
 #include <unordered_map>
-#include <vector>
 
 using namespace reshade::api;
-using namespace ShaderToggler;
-using namespace AddonImGui;
-using namespace Shim::Constants;
-using namespace std;
 
-extern "C" __declspec(dllexport) const char* NAME = "Reshade Effect Shader Toggler";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Addon which allows you to define groups of shaders to render Reshade effects on.";
+extern "C" __declspec(dllexport) const char *NAME = "FHX Vulkan REST";
+extern "C" __declspec(dllexport) const char *DESCRIPTION =
+    "FHX-specific Vulkan ReShade effect injector that renders before the Primary UI pass.";
 
-constexpr auto MAX_EFFECT_HANDLES = 128;
-constexpr auto REST_VAR_ANNOTATION = "source";
+namespace
+{
+constexpr uint32_t kPrimaryUiPixelShader = 0xCF49F7D6u;
 
-static filesystem::path g_dllPath;
-static filesystem::path g_basePath;
+struct PassSignature
+{
+    bool valid = false;
+    uint32_t colorWidth = 0;
+    uint32_t colorHeight = 0;
+    uint32_t colorSamples = 0;
+    format colorFormat = format::unknown;
+    render_pass_load_op colorLoad = render_pass_load_op::load;
+    render_pass_store_op colorStore = render_pass_store_op::store;
 
-static ShaderToggler::ShaderManager g_pixelShaderManager;
-static ShaderToggler::ShaderManager g_vertexShaderManager;
-static ShaderToggler::ShaderManager g_computeShaderManager;
+    bool hasDepth = false;
+    uint32_t depthWidth = 0;
+    uint32_t depthHeight = 0;
+    uint32_t depthSamples = 0;
+    format depthFormat = format::unknown;
+    render_pass_load_op depthLoad = render_pass_load_op::load;
+    render_pass_store_op depthStore = render_pass_store_op::store;
+};
 
-static ConstantManager constantManager;
-static ConstantHandlerBase* constantHandler = nullptr;
-static ConstantCopyBase* constantCopy = nullptr;
-static bool constantHandlerHooked = false;
+struct LearnedUiTarget
+{
+    PassSignature signature = {};
+    uint32_t localOccurrence = 0;
+};
 
-static atomic_uint32_t g_activeCollectorFrameCounter = 0;
-static AddonUIData g_addonUIData(&g_pixelShaderManager, &g_vertexShaderManager, &g_computeShaderManager, constantHandler, &g_activeCollectorFrameCounter);
+struct CommandState
+{
+    bool insideRenderPass = false;
+    resource_view currentRenderTarget = { 0 };
+    resource currentRenderTargetResource = { 0 };
+    PassSignature currentPassSignature = {};
+    uint32_t currentResourceOccurrence = 0;
+    std::unordered_map<uint64_t, uint32_t> resourcePassOccurrences;
+};
 
-static KeyMonitor keyMonitor;
-static Rendering::ResourceManager resourceManager;
-static Rendering::ToggleGroupResourceManager groupResourceManager;
-static Rendering::RenderingShaderManager renderingShaderManager(g_addonUIData, resourceManager);
-static Rendering::RenderingEffectManager renderingEffectManager(g_addonUIData, resourceManager, renderingShaderManager, groupResourceManager);
-static Rendering::RenderingBindingManager renderingBindingManager(g_addonUIData, resourceManager, groupResourceManager);
-static Rendering::RenderingPreviewManager renderingPreviewManager(g_addonUIData, resourceManager, renderingShaderManager);
-static Rendering::RenderingQueueManager renderingQueueManager(g_addonUIData, resourceManager);
-static ShaderToggler::TechniqueManager techniqueManager(keyMonitor);
+std::mutex g_mutex;
+std::unordered_map<uint64_t, uint32_t> g_pixelShaderByPipeline;
+std::unordered_map<command_list *, CommandState> g_commandStates;
+std::unordered_map<uint64_t, LearnedUiTarget> g_learnedUiTargets;
 
-// TODO: actually implement ability to turn off srgb-view generation
-static vector<effect_runtime*> runtimes;
+effect_runtime *g_runtime = nullptr;
+bool g_enabled = true;
+bool g_injectedThisPresent = false;
 
-/// <summary>
-/// Calculates a crc32 hash from the passed in shader bytecode. The hash is used to identity the shader in future runs.
-/// </summary>
-/// <param name="shaderData"></param>
-/// <returns></returns>
-static uint32_t calculateShaderHash(void* shaderData) {
-    if (nullptr == shaderData) {
+thread_local bool g_insideManualRender = false;
+
+uint64_t g_targetLearnEvents = 0;
+uint64_t g_targetRelearnEvents = 0;
+uint64_t g_preUiRenders = 0;
+uint64_t g_presentCount = 0;
+
+uint32_t calculateShaderHash(const void *shaderData)
+{
+    if (shaderData == nullptr)
         return 0;
-    }
 
-    const auto shaderDesc = *static_cast<shader_desc*>(shaderData);
-    return compute_crc32(static_cast<const uint8_t*>(shaderDesc.code), shaderDesc.code_size);
+    const shader_desc shader = *static_cast<const shader_desc *>(shaderData);
+    if (shader.code == nullptr || shader.code_size == 0)
+        return 0;
+
+    return compute_crc32(static_cast<const uint8_t *>(shader.code), shader.code_size);
 }
 
-static void onInitDevice(device* device) {
-    device->create_private_data<DeviceDataContainer>();
+bool samePassSignature(const PassSignature &a, const PassSignature &b)
+{
+    return a.valid && b.valid &&
+           a.colorWidth == b.colorWidth &&
+           a.colorHeight == b.colorHeight &&
+           a.colorSamples == b.colorSamples &&
+           a.colorFormat == b.colorFormat &&
+           a.colorLoad == b.colorLoad &&
+           a.colorStore == b.colorStore &&
+           a.hasDepth == b.hasDepth &&
+           (!a.hasDepth ||
+            (a.depthWidth == b.depthWidth &&
+             a.depthHeight == b.depthHeight &&
+             a.depthSamples == b.depthSamples &&
+             a.depthFormat == b.depthFormat &&
+             a.depthLoad == b.depthLoad &&
+             a.depthStore == b.depthStore));
 }
 
-static void onDestroyDevice(device* device) {
-    DeviceDataContainer& data = device->get_private_data<DeviceDataContainer>();
+PassSignature buildPassSignature(command_list *cmdList,
+                                 uint32_t count,
+                                 const render_pass_render_target_desc *rts,
+                                 const render_pass_depth_stencil_desc *ds)
+{
+    PassSignature sig = {};
 
-    groupResourceManager.DisposeGroupBuffers(device, g_addonUIData.GetToggleGroups());
-    renderingBindingManager.DisposeTextureBindings(device, g_addonUIData.GetToggleGroups());
-    resourceManager.OnDestroyDevice(device);
-    renderingShaderManager.DestroyShaders(device);
+    if (cmdList == nullptr || count != 1 || rts == nullptr || rts[0].view.handle == 0)
+        return sig;
 
-    device->destroy_private_data<DeviceDataContainer>();
-}
+    device *dev = cmdList->get_device();
+    if (dev == nullptr)
+        return sig;
 
-static void onInitCommandList(command_list* commandList) {
-    commandList->create_private_data<CommandListDataContainer>();
-}
+    const resource colorResource = dev->get_resource_from_view(rts[0].view);
+    if (colorResource.handle == 0)
+        return sig;
 
-static void onDestroyCommandList(command_list* commandList) {
-    commandList->destroy_private_data<CommandListDataContainer>();
-}
+    const resource_desc colorDesc = dev->get_resource_desc(colorResource);
+    if (colorDesc.type != resource_type::texture_2d)
+        return sig;
 
-static void onResetCommandList(command_list* commandList) {
-    CommandListDataContainer& commandListData = commandList->get_private_data<CommandListDataContainer>();
-    commandListData.Reset();
-}
+    const resource_view_desc colorViewDesc = dev->get_resource_view_desc(rts[0].view);
 
-static bool onCreateSwapchain(swapchain_desc& desc, void* hwnd) {
-    return resourceManager.OnCreateSwapchain(desc, hwnd);
-}
+    sig.colorWidth = colorDesc.texture.width;
+    sig.colorHeight = colorDesc.texture.height;
+    sig.colorSamples = colorDesc.texture.samples;
+    sig.colorFormat =
+        colorViewDesc.format != format::unknown ? colorViewDesc.format : colorDesc.texture.format;
+    sig.colorLoad = rts[0].load_op;
+    sig.colorStore = rts[0].store_op;
 
-static void onInitSwapchain(reshade::api::swapchain* swapchain) {
-    resourceManager.OnInitSwapchain(swapchain);
-}
+    if (ds != nullptr && ds->view.handle != 0)
+    {
+        const resource depthResource = dev->get_resource_from_view(ds->view);
+        if (depthResource.handle != 0)
+        {
+            const resource_desc depthDesc = dev->get_resource_desc(depthResource);
+            const resource_view_desc depthViewDesc = dev->get_resource_view_desc(ds->view);
 
-static void onDestroySwapchain(reshade::api::swapchain* swapchain) {
-    resourceManager.OnDestroySwapchain(swapchain);
-}
-
-static bool onCreateResource(device* device, resource_desc& desc, subresource_data* initial_data, resource_usage initial_state) {
-    return resourceManager.OnCreateResource(device, desc, initial_data, initial_state);
-}
-
-static void onInitResource(device* device, const resource_desc& desc, const subresource_data* initData, resource_usage usage, reshade::api::resource handle) {
-    resourceManager.OnInitResource(device, desc, initData, usage, handle);
-
-    if (constantCopy != nullptr)
-        constantCopy->OnInitResource(device, desc, initData, usage, handle);
-}
-
-static void onDestroyResource(device* device, resource res) {
-    resourceManager.OnDestroyResource(device, res);
-
-    if (constantCopy != nullptr)
-        constantCopy->OnDestroyResource(device, res);
-}
-
-static bool onCreateResourceView(device* device, resource resource, resource_usage usage_type, resource_view_desc& desc) {
-    return resourceManager.OnCreateResourceView(device, resource, usage_type, desc);
-}
-
-static void onInitResourceView(device* device, resource resource, resource_usage usage_type, const resource_view_desc& desc, resource_view view) {
-    resourceManager.OnInitResourceView(device, resource, usage_type, desc, view);
-}
-
-static void onDestroyResourceView(device* device, resource_view view) {
-    resourceManager.OnDestroyResourceView(device, view);
-}
-
-static void onReshadeReloadedEffects(effect_runtime* runtime) {
-    RuntimeDataContainer& runtimeData = runtime->get_private_data<RuntimeDataContainer>();
-    DeviceDataContainer& deviceData = runtime->get_device()->get_private_data<DeviceDataContainer>();
-
-    techniqueManager.OnReshadeReloadedEffects(runtime);
-
-    if (deviceData.current_runtime == runtime) {
-        shared_lock<shared_mutex> techLock(runtimeData.technique_mutex);
-        g_addonUIData.AssignPreferredGroupTechniques(runtimeData.allTechniques);
-    }
-}
-
-static bool onReshadeSetTechniqueState(effect_runtime* runtime, effect_technique technique, bool enabled) {
-    RuntimeDataContainer& data = runtime->get_private_data<RuntimeDataContainer>();
-
-    bool ret = techniqueManager.OnReshadeSetTechniqueState(runtime, technique, enabled);
-
-    return ret;
-}
-
-static bool onReshadeReorderTechniques(effect_runtime* runtime, size_t count, effect_technique* techniques) {
-    RuntimeDataContainer& runtimeData = runtime->get_private_data<RuntimeDataContainer>();
-    DeviceDataContainer& deviceData = runtime->get_device()->get_private_data<DeviceDataContainer>();
-
-    bool ret = techniqueManager.OnReshadeReorderTechniques(runtime, count, techniques);
-
-    if (deviceData.current_runtime == runtime) {
-        shared_lock<shared_mutex> techLock(runtimeData.technique_mutex);
-        g_addonUIData.AssignPreferredGroupTechniques(runtimeData.allTechniques);
-    }
-
-    return ret;
-}
-
-static void onInitEffectRuntime(effect_runtime* runtime) {
-    runtime->create_private_data<RuntimeDataContainer>();
-    DeviceDataContainer& data = runtime->get_device()->get_private_data<DeviceDataContainer>();
-
-    keyMonitor.Init(runtime);
-    renderingShaderManager.InitShaders(runtime->get_device());
-
-    // Push new runtime on top
-    runtimes.push_back(runtime);
-    data.current_runtime = runtime;
-
-    renderingBindingManager.InitTextureBingings(runtime);
-
-    if (constantHandler != nullptr) {
-        constantHandler->ReloadConstantVariables(runtime);
-    }
-}
-
-static void onDestroyEffectRuntime(effect_runtime* runtime) {
-    DeviceDataContainer& data = runtime->get_device()->get_private_data<DeviceDataContainer>();
-
-    renderingBindingManager.DisposeTextureBindings(runtime->get_device(), g_addonUIData.GetToggleGroups());
-
-    // Remove runtime from stack
-    for (auto it = runtimes.begin(); it != runtimes.end();) {
-        if (runtime == *it) {
-            it = runtimes.erase(it);
-            continue;
-        }
-
-        it++;
-    }
-
-    // Pick the runtime on top of our stack if there are any
-    if (runtime == data.current_runtime) {
-        if (runtimes.size() > 0) {
-            data.current_runtime = runtimes[runtimes.size() - 1];
-
-            if (constantHandler != nullptr) {
-                constantHandler->ReloadConstantVariables(data.current_runtime);
-            }
-        } else {
-            data.current_runtime = nullptr;
-
-            if (constantHandler != nullptr) {
-                constantHandler->ClearConstantVariables();
+            if (depthDesc.type == resource_type::texture_2d)
+            {
+                sig.hasDepth = true;
+                sig.depthWidth = depthDesc.texture.width;
+                sig.depthHeight = depthDesc.texture.height;
+                sig.depthSamples = depthDesc.texture.samples;
+                sig.depthFormat =
+                    depthViewDesc.format != format::unknown ? depthViewDesc.format : depthDesc.texture.format;
+                sig.depthLoad = ds->depth_load_op;
+                sig.depthStore = ds->depth_store_op;
             }
         }
     }
 
-    runtime->destroy_private_data<RuntimeDataContainer>();
+    sig.valid = true;
+    return sig;
 }
 
-static void onInitPipeline(device* device, pipeline_layout, uint32_t subobjectCount, const pipeline_subobject* subobjects, pipeline pipelineHandle) {
-    // shader has been created, we will now create a hash and store it with the handle we got.
-    for (uint32_t i = 0; i < subobjectCount; ++i) {
-        switch (subobjects[i].type) {
-            case pipeline_subobject_type::vertex_shader: {
-                g_vertexShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
-            } break;
-            case pipeline_subobject_type::pixel_shader: {
-                g_pixelShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
-            } break;
-            case pipeline_subobject_type::compute_shader: {
-                g_computeShaderManager.addHashHandlePair(calculateShaderHash(subobjects[i].data), pipelineHandle.handle);
-            } break;
-        }
-    }
+bool isFullResolutionUiCandidate(effect_runtime *runtime, const PassSignature &sig)
+{
+    if (runtime == nullptr || !sig.valid || sig.colorSamples != 1)
+        return false;
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    runtime->get_screenshot_width_and_height(&width, &height);
+
+    return width != 0 &&
+           height != 0 &&
+           sig.colorWidth == width &&
+           sig.colorHeight == height;
 }
 
-static void onDestroyPipeline(device* device, pipeline pipelineHandle) {
-    g_pixelShaderManager.removeHandle(pipelineHandle.handle);
-    g_vertexShaderManager.removeHandle(pipelineHandle.handle);
-    g_computeShaderManager.removeHandle(pipelineHandle.handle);
-}
-
-static void onBindPipeline(command_list* commandList, pipeline_stage stages, pipeline pipelineHandle) {
-    if (nullptr == commandList || pipelineHandle.handle == 0 ||
-        !((uint32_t)(stages & pipeline_stage::pixel_shader) || (uint32_t)(stages & pipeline_stage::vertex_shader) ||
-          (uint32_t)(stages & pipeline_stage::compute_shader))) {
+void onInitPipeline(device *,
+                    pipeline_layout,
+                    uint32_t subobjectCount,
+                    const pipeline_subobject *subobjects,
+                    pipeline pipelineHandle)
+{
+    if (pipelineHandle.handle == 0 || subobjects == nullptr)
         return;
-    }
 
-    const uint32_t handleHasPixelShaderAttached =
-      (uint32_t)(stages & pipeline_stage::pixel_shader) ? g_pixelShaderManager.safeGetShaderHash(pipelineHandle.handle) : 0;
-    const uint32_t handleHasVertexShaderAttached =
-      (uint32_t)(stages & pipeline_stage::vertex_shader) ? g_vertexShaderManager.safeGetShaderHash(pipelineHandle.handle) : 0;
-    const uint32_t handleHasComputeShaderAttached =
-      (uint32_t)(stages & pipeline_stage::compute_shader) ? g_computeShaderManager.safeGetShaderHash(pipelineHandle.handle) : 0;
-
-    if (!handleHasPixelShaderAttached && !handleHasVertexShaderAttached && !handleHasComputeShaderAttached) {
-        // draw call with unknown handle, don't collect it
-        return;
-    }
-    CommandListDataContainer& commandListData = commandList->get_private_data<CommandListDataContainer>();
-    DeviceDataContainer& deviceData = commandList->get_device()->get_private_data<DeviceDataContainer>();
-
-    if (deviceData.current_runtime == nullptr || !deviceData.current_runtime->get_effects_state()) {
-        return;
-    }
-
-    uint32_t pipelineChanged = 0;
-
-    if ((uint32_t)(stages & pipeline_stage::pixel_shader) && handleHasPixelShaderAttached) {
-        if (g_activeCollectorFrameCounter > 0) {
-            // in collection mode
-            g_pixelShaderManager.addActivePipelineHandle(pipelineHandle.handle);
-        }
-        if (commandListData.ps.activeShaderHash != handleHasPixelShaderAttached) {
-            pipelineChanged |= Rendering::MATCH_EFFECT_PS | Rendering::MATCH_BINDING_PS | Rendering::MATCH_PREVIEW_PS | Rendering::MATCH_CONST_PS;
-            commandListData.ps.constantBuffersToUpdate.clear();
-        }
-
-        commandListData.ps.blockedShaderGroups = g_addonUIData.GetToggleGroupsForPixelShaderHash(handleHasPixelShaderAttached);
-        commandListData.ps.activeShaderHash = handleHasPixelShaderAttached;
-    }
-
-    if ((uint32_t)(stages & pipeline_stage::vertex_shader) && handleHasVertexShaderAttached) {
-        if (g_activeCollectorFrameCounter > 0) {
-            // in collection mode
-            g_vertexShaderManager.addActivePipelineHandle(pipelineHandle.handle);
-        }
-        if (commandListData.vs.activeShaderHash != handleHasVertexShaderAttached) {
-            pipelineChanged |= Rendering::MATCH_EFFECT_VS | Rendering::MATCH_BINDING_VS | Rendering::MATCH_PREVIEW_VS | Rendering::MATCH_CONST_VS;
-            commandListData.vs.constantBuffersToUpdate.clear();
-        }
-
-        commandListData.vs.blockedShaderGroups = g_addonUIData.GetToggleGroupsForVertexShaderHash(handleHasVertexShaderAttached);
-        commandListData.vs.activeShaderHash = handleHasVertexShaderAttached;
-    }
-
-    if ((uint32_t)(stages & pipeline_stage::compute_shader) && handleHasComputeShaderAttached) {
-        if (g_activeCollectorFrameCounter > 0) {
-            // in collection mode
-            g_computeShaderManager.addActivePipelineHandle(pipelineHandle.handle);
-        }
-        if (commandListData.cs.activeShaderHash != handleHasComputeShaderAttached) {
-            pipelineChanged |= Rendering::MATCH_EFFECT_CS | Rendering::MATCH_BINDING_CS | Rendering::MATCH_PREVIEW_CS | Rendering::MATCH_CONST_CS;
-            commandListData.cs.constantBuffersToUpdate.clear();
-        }
-
-        commandListData.cs.blockedShaderGroups = g_addonUIData.GetToggleGroupsForComputeShaderHash(handleHasComputeShaderAttached);
-        commandListData.cs.activeShaderHash = handleHasComputeShaderAttached;
-    }
-
-    if (pipelineChanged > 0) {
-        // Perform updates scheduled for after a shader has been applied. Only do so once the draw flag has been cleared.
-        if (commandListData.commandQueue & Rendering::CHECK_MATCH_BIND_PIPELINE_PREVIEW &&
-            !(commandListData.commandQueue & pipelineChanged & Rendering::MATCH_PREVIEW)) {
-            renderingPreviewManager.UpdatePreview(commandList, Rendering::CALL_BIND_PIPELINE, pipelineChanged & Rendering::MATCH_PREVIEW);
-        }
-
-        if (commandListData.commandQueue & Rendering::CHECK_MATCH_BIND_PIPELINE_BINDING &&
-            !(commandListData.commandQueue & pipelineChanged & Rendering::MATCH_BINDING)) {
-            renderingBindingManager.UpdateTextureBindings(commandList, Rendering::CALL_BIND_PIPELINE, pipelineChanged & Rendering::MATCH_BINDING);
-        }
-
-        if (commandListData.commandQueue & Rendering::CHECK_MATCH_BIND_PIPELINE_EFFECT &&
-            !(commandListData.commandQueue & pipelineChanged & Rendering::MATCH_EFFECT)) {
-            renderingEffectManager.RenderEffects(commandList, Rendering::CALL_BIND_PIPELINE, pipelineChanged & Rendering::MATCH_EFFECT);
-        }
-
-        renderingQueueManager.ClearQueue(commandListData, pipelineChanged);
-        renderingQueueManager.CheckCallForCommandList(commandList);
-    }
-}
-
-static void onBindRenderTargetsAndDepthStencil(command_list* cmd_list, uint32_t count, const resource_view* rtvs, resource_view dsv) {
-    if (cmd_list == nullptr || cmd_list->get_device() == nullptr) {
-        return;
-    }
-
-    device* device = cmd_list->get_device();
-    CommandListDataContainer& commandListData = cmd_list->get_private_data<CommandListDataContainer>();
-    DeviceDataContainer& deviceData = device->get_private_data<DeviceDataContainer>();
-
-    // if (count > 0)
-    //{
-    if (commandListData.commandQueue & Rendering::CHECK_MATCH_BIND_RENDERTARGET_PREVIEW &&
-        !(commandListData.commandQueue & Rendering::CHECK_MATCH_DRAW_PREVIEW)) {
-        renderingPreviewManager.UpdatePreview(cmd_list, Rendering::CALL_BIND_RENDER_TARGET, Rendering::MATCH_PREVIEW);
-    }
-
-    if (commandListData.commandQueue & Rendering::CHECK_MATCH_BIND_RENDERTARGET_BINDING &&
-        !(commandListData.commandQueue & Rendering::CHECK_MATCH_DRAW_BINDING)) {
-        renderingBindingManager.UpdateTextureBindings(cmd_list, Rendering::CALL_BIND_RENDER_TARGET, Rendering::MATCH_BINDING);
-    }
-
-    if (commandListData.commandQueue & Rendering::CHECK_MATCH_BIND_RENDERTARGET_EFFECT &&
-        !(commandListData.commandQueue & Rendering::CHECK_MATCH_DRAW_EFFECT)) {
-        renderingEffectManager.RenderEffects(cmd_list, Rendering::CALL_BIND_RENDER_TARGET, Rendering::MATCH_EFFECT);
-    }
-
-    renderingQueueManager.RescheduleGroups(commandListData, deviceData);
-    //}
-}
-
-static void onBeginRenderPass(command_list* cmd_list, uint32_t count, const render_pass_render_target_desc* rts, const render_pass_depth_stencil_desc* ds) {
-    if (cmd_list == nullptr || cmd_list->get_device() == nullptr) {
-        return;
-    }
-
-    device* device = cmd_list->get_device();
-    CommandListDataContainer& commandListData = cmd_list->get_private_data<CommandListDataContainer>();
-    DeviceDataContainer& deviceData = device->get_private_data<DeviceDataContainer>();
-
-    if (!deviceData.current_runtime->get_effects_state()) {
-        return;
-    }
-
-    if (commandListData.commandQueue & Rendering::CHECK_MATCH_DRAW_BINDING) {
-        renderingBindingManager.UpdateTextureBindings(cmd_list, Rendering::CALL_DRAW, Rendering::MATCH_BINDING_PS | Rendering::MATCH_BINDING_VS);
-    }
-
-    if (commandListData.commandQueue & Rendering::CHECK_MATCH_DRAW_EFFECT) {
-        renderingEffectManager.RenderEffects(cmd_list, Rendering::CALL_DRAW, Rendering::MATCH_EFFECT_PS | Rendering::MATCH_EFFECT_VS);
-    }
-}
-
-static void onReshadeOverlay(effect_runtime* runtime) {
-    DisplayOverlay(g_addonUIData, resourceManager, runtime);
-}
-
-static void onPresent(command_queue* queue,
-                      swapchain* swapchain,
-                      const rect* source_rect,
-                      const rect* dest_rect,
-                      uint32_t dirty_rect_count,
-                      const rect* dirty_rects) {
-    device* dev = queue->get_device();
-    DeviceDataContainer& deviceData = dev->get_private_data<DeviceDataContainer>();
-
-    if (deviceData.current_runtime == nullptr) {
-        return;
-    }
-
-    effect_runtime* runtime = deviceData.current_runtime;
-
-    if (queue == runtime->get_command_queue()) {
-        if (runtime->get_effects_state()) {
-            renderingEffectManager.RenderRemainingEffects(runtime);
-        }
-    }
-
-    if (dev->get_api() != device_api::d3d12 && dev->get_api() != device_api::vulkan)
-        onResetCommandList(runtime->get_command_queue()->get_immediate_command_list());
-}
-
-static void onReshadePresent(effect_runtime* runtime) {
-    device* dev = runtime->get_device();
-    DeviceDataContainer& deviceData = dev->get_private_data<DeviceDataContainer>();
-    command_queue* queue = runtime->get_command_queue();
-
-    deviceData.rendered_effects = false;
-
-    keyMonitor.PollKeyStates(runtime);
-
-    if (g_addonUIData.GetPreventRuntimeReload()) {
-        renderingEffectManager.PreventRuntimeReload(runtime, queue->get_immediate_command_list());
-    }
-
-    if (runtime->get_effects_state()) {
-        resourceManager.CheckPreview(queue->get_immediate_command_list(), dev);
-        groupResourceManager.CheckGroupBuffers(runtime, g_addonUIData.GetToggleGroups());
-        renderingBindingManager.ClearUnmatchedTextureBindings(runtime->get_command_queue()->get_immediate_command_list());
-        resourceManager.CheckResourceViews(runtime);
-    }
-
-    techniqueManager.OnReshadePresent(runtime);
-
-    deviceData.bindingsUpdated.clear();
-    deviceData.constantsUpdated.clear();
-    deviceData.huntPreview.Reset();
-
-    CheckHotkeys(g_addonUIData, runtime);
-}
-
-static void onMapBufferRegion(device* device, resource resource, uint64_t offset, uint64_t size, map_access access, void** data) {
-    if (constantCopy != nullptr)
-        constantCopy->OnMapBufferRegion(device, resource, offset, size, access, data);
-}
-
-static void onUnmapBufferRegion(device* device, resource resource) {
-    if (constantCopy != nullptr)
-        constantCopy->OnUnmapBufferRegion(device, resource);
-}
-
-static bool onUpdateBufferRegion(device* device, const void* data, resource resource, uint64_t offset, uint64_t size) {
-    if (constantCopy != nullptr)
-        constantCopy->OnUpdateBufferRegion(device, data, resource, offset, size);
-
-    return false;
-}
-
-static void displaySettings(effect_runtime* runtime) {
-    DisplaySettings(g_addonUIData, runtime);
-}
-
-static void Init() {
-    resourceManager.SetResourceShim(g_addonUIData.GetResourceShim());
-    resourceManager.Init();
-    constantManager.Init(g_addonUIData, groupResourceManager, &constantCopy, &constantHandler);
-
-    g_addonUIData.AddToggleGroupRemovalCallback(
-      std::bind(&Rendering::ToggleGroupResourceManager::ToggleGroupRemoved, &groupResourceManager, std::placeholders::_1, std::placeholders::_2));
-    techniqueManager.AddEffectsReloadingCallback(std::bind(&Shim::Constants::ConstantHandlerBase::OnEffectsReloading, constantHandler, std::placeholders::_1));
-    techniqueManager.AddEffectsReloadedCallback(std::bind(&Shim::Constants::ConstantHandlerBase::OnEffectsReloaded, constantHandler, std::placeholders::_1));
-    techniqueManager.AddEffectsReloadingCallback(std::bind(&Rendering::ResourceManager::OnEffectsReloading, &resourceManager, std::placeholders::_1));
-    techniqueManager.AddEffectsReloadedCallback(std::bind(&Rendering::ResourceManager::OnEffectsReloaded, &resourceManager, std::placeholders::_1));
-}
-
-static void UnInit() {
-    constantManager.UnInit();
-}
-
-static void CheckDrawCall(command_list* cmd_list, const uint64_t match_modifier = Rendering::MATCH_ALL) {
-    CommandListDataContainer& commandListData = cmd_list->get_private_data<CommandListDataContainer>();
-
-    if (commandListData.commandQueue & Rendering::MATCH_ALL & match_modifier) {
-        if (constantHandler != nullptr && (commandListData.commandQueue & Rendering::MATCH_CONST & match_modifier)) {
-            constantHandler->UpdateConstants(cmd_list);
-            commandListData.commandQueue &= ~(Rendering::MATCH_CONST & match_modifier);
-        }
-
-        if (commandListData.commandQueue & Rendering::MATCH_PREVIEW & match_modifier) {
-            renderingPreviewManager.UpdatePreview(cmd_list, Rendering::CALL_DRAW, Rendering::MATCH_PREVIEW & match_modifier);
-        }
-
-        if (commandListData.commandQueue & Rendering::MATCH_BINDING & match_modifier) {
-            renderingBindingManager.UpdateTextureBindings(cmd_list, Rendering::CALL_DRAW, Rendering::MATCH_BINDING & match_modifier);
-        }
-
-        if (commandListData.commandQueue & Rendering::MATCH_EFFECT & match_modifier) {
-            renderingEffectManager.RenderEffects(cmd_list, Rendering::CALL_DRAW, Rendering::MATCH_EFFECT & match_modifier);
-        }
-    }
-}
-
-static bool onDraw(command_list* cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
-    CheckDrawCall(cmd_list, Rendering::MATCH_PS | Rendering::MATCH_VS);
-
-    return false;
-}
-
-static bool onDispatch(command_list* cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z) {
-    CheckDrawCall(cmd_list, Rendering::MATCH_CS);
-
-    return false;
-}
-
-static bool onDrawIndexed(command_list* cmd_list,
-                          uint32_t index_count,
-                          uint32_t instance_count,
-                          uint32_t first_index,
-                          int32_t vertex_offset,
-                          uint32_t first_instance) {
-    CheckDrawCall(cmd_list, Rendering::MATCH_PS | Rendering::MATCH_VS);
-
-    return false;
-}
-
-static bool onDrawOrDispatchIndirect(command_list* cmd_list, indirect_command type, resource buffer, uint64_t offset, uint32_t draw_count, uint32_t stride) {
-    switch (type) {
-        case indirect_command::unknown:
-            CheckDrawCall(cmd_list);
+    uint32_t pixelHash = 0;
+    for (uint32_t i = 0; i < subobjectCount; ++i)
+    {
+        if (subobjects[i].type == pipeline_subobject_type::pixel_shader)
+        {
+            pixelHash = calculateShaderHash(subobjects[i].data);
             break;
-        case indirect_command::draw:
-        case indirect_command::draw_indexed:
-            CheckDrawCall(cmd_list, Rendering::MATCH_PS | Rendering::MATCH_VS);
-            break;
-        case indirect_command::dispatch:
-            CheckDrawCall(cmd_list, Rendering::MATCH_CS);
-            break;
+        }
     }
 
-    return false;
+    if (pixelHash == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_pixelShaderByPipeline[pipelineHandle.handle] = pixelHash;
 }
 
-/// <summary>
-/// copied from Reshade
-/// Returns the path to the module file identified by the specified <paramref name="module"/> handle.
-/// </summary>
-filesystem::path getModulePath(HMODULE module) {
-    WCHAR buf[4096];
-    return GetModuleFileNameW(module, buf, ARRAYSIZE(buf)) ? buf : filesystem::path();
+void onDestroyPipeline(device *, pipeline pipelineHandle)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_pixelShaderByPipeline.erase(pipelineHandle.handle);
 }
 
-// FHX Restoration / 32-bit DXVK/Vulkan diagnostic safe mode.
-// This first-stage build deliberately avoids REST's resource, descriptor,
-// render-target and effect-runtime interception during process startup.
-// It only registers the add-on, tracks created shader pipelines, and exposes
-// a tiny ReShade settings panel so we can prove the x86 Vulkan path is stable
-// before re-enabling REST functionality incrementally.
-static void displayFHXSafeSettings(effect_runtime*) {
-    ImGui::TextUnformatted("REST FHX Safe Mode");
+void onResetCommandList(command_list *cmdList)
+{
+    if (cmdList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_commandStates[cmdList] = CommandState {};
+}
+
+void onDestroyCommandList(command_list *cmdList)
+{
+    if (cmdList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_commandStates.erase(cmdList);
+}
+
+void onDestroyResource(device *, resource resourceHandle)
+{
+    if (resourceHandle.handle == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_learnedUiTargets.erase(resourceHandle.handle);
+}
+
+void onBindPipeline(command_list *cmdList, pipeline_stage stages, pipeline pipelineHandle)
+{
+    if (g_insideManualRender || cmdList == nullptr || pipelineHandle.handle == 0)
+        return;
+
+    if ((static_cast<uint32_t>(stages & pipeline_stage::pixel_shader)) == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    const auto pipelineIt = g_pixelShaderByPipeline.find(pipelineHandle.handle);
+    if (pipelineIt == g_pixelShaderByPipeline.end() ||
+        pipelineIt->second != kPrimaryUiPixelShader)
+        return;
+
+    const auto stateIt = g_commandStates.find(cmdList);
+    if (stateIt == g_commandStates.end())
+        return;
+
+    const CommandState &state = stateIt->second;
+    if (!state.insideRenderPass ||
+        state.currentRenderTargetResource.handle == 0 ||
+        !state.currentPassSignature.valid ||
+        state.currentResourceOccurrence == 0)
+        return;
+
+    const uint64_t resourceHandle = state.currentRenderTargetResource.handle;
+    const LearnedUiTarget learned {
+        state.currentPassSignature,
+        state.currentResourceOccurrence
+    };
+
+    const auto learnedIt = g_learnedUiTargets.find(resourceHandle);
+    if (learnedIt == g_learnedUiTargets.end())
+    {
+        g_learnedUiTargets.emplace(resourceHandle, learned);
+        ++g_targetLearnEvents;
+    }
+    else if (!samePassSignature(learnedIt->second.signature, learned.signature) ||
+             learnedIt->second.localOccurrence != learned.localOccurrence)
+    {
+        learnedIt->second = learned;
+        ++g_targetRelearnEvents;
+    }
+}
+
+void onBeginRenderPass(command_list *cmdList,
+                       uint32_t count,
+                       const render_pass_render_target_desc *rts,
+                       const render_pass_depth_stencil_desc *ds)
+{
+    if (g_insideManualRender || cmdList == nullptr)
+        return;
+
+    resource_view target = { 0 };
+    resource targetResource = { 0 };
+    PassSignature signature = buildPassSignature(cmdList, count, rts, ds);
+
+    if (count != 0 && rts != nullptr && rts[0].view.handle != 0)
+    {
+        target = rts[0].view;
+        targetResource = cmdList->get_device()->get_resource_from_view(target);
+    }
+
+    effect_runtime *runtime = nullptr;
+    uint32_t localOccurrence = 0;
+    bool shouldInject = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        CommandState &state = g_commandStates[cmdList];
+
+        if (targetResource.handle != 0)
+            localOccurrence = ++state.resourcePassOccurrences[targetResource.handle];
+
+        state.currentRenderTarget = target;
+        state.currentRenderTargetResource = targetResource;
+        state.currentPassSignature = signature;
+        state.currentResourceOccurrence = localOccurrence;
+
+        runtime = g_runtime;
+
+        if (g_enabled &&
+            !g_injectedThisPresent &&
+            runtime != nullptr &&
+            runtime->get_effects_state() &&
+            runtime->get_device() == cmdList->get_device() &&
+            target.handle != 0 &&
+            targetResource.handle != 0 &&
+            isFullResolutionUiCandidate(runtime, signature))
+        {
+            const auto learnedIt = g_learnedUiTargets.find(targetResource.handle);
+            if (learnedIt != g_learnedUiTargets.end() &&
+                learnedIt->second.localOccurrence == localOccurrence &&
+                samePassSignature(learnedIt->second.signature, signature))
+            {
+                shouldInject = true;
+            }
+        }
+    }
+
+    if (shouldInject)
+    {
+        // This is the actual pre-UI injection point. The target was learned
+        // from a previous Primary-UI draw on this exact render-target resource,
+        // render-pass structure and resource-local occurrence. No frame-global
+        // pass numbers, command-list identities or candidate ordering are used.
+        g_insideManualRender = true;
+        runtime->render_effects(cmdList, target, target);
+        g_insideManualRender = false;
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_injectedThisPresent = true;
+        ++g_preUiRenders;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_commandStates[cmdList].insideRenderPass = true;
+    }
+}
+
+void onEndRenderPass(command_list *cmdList)
+{
+    if (g_insideManualRender || cmdList == nullptr)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    CommandState &state = g_commandStates[cmdList];
+    state.insideRenderPass = false;
+    state.currentRenderTarget = { 0 };
+    state.currentRenderTargetResource = { 0 };
+    state.currentPassSignature = {};
+    state.currentResourceOccurrence = 0;
+}
+
+void onInitEffectRuntime(effect_runtime *runtime)
+{
+    if (runtime == nullptr || runtime->get_device() == nullptr)
+        return;
+
+    if (runtime->get_device()->get_api() != device_api::vulkan)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_runtime = runtime;
+}
+
+void onDestroyEffectRuntime(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_runtime == runtime)
+    {
+        g_runtime = nullptr;
+        g_learnedUiTargets.clear();
+        g_injectedThisPresent = false;
+    }
+}
+
+void onReshadePresent(effect_runtime *runtime)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (runtime == g_runtime)
+    {
+        ++g_presentCount;
+        g_injectedThisPresent = false;
+    }
+}
+
+void displaySettings(effect_runtime *)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    ImGui::TextUnformatted("FHX Vulkan REST");
     ImGui::Separator();
-    ImGui::Text("Pixel shaders discovered: %zu", g_pixelShaderManager.getShaderCount());
-    ImGui::Text("Vertex shaders discovered: %zu", g_vertexShaderManager.getShaderCount());
-    ImGui::Text("Compute shaders discovered: %zu", g_computeShaderManager.getShaderCount());
+    ImGui::Checkbox("Render enabled ReShade effects before Primary UI", &g_enabled);
+    ImGui::Text("Primary UI shader: 0x%08X", kPrimaryUiPixelShader);
+
+    if (!g_enabled)
+        ImGui::TextUnformatted("Status: disabled");
+    else if (g_runtime == nullptr)
+        ImGui::TextUnformatted("Status: waiting for Vulkan runtime");
+    else if (g_learnedUiTargets.empty())
+        ImGui::TextUnformatted("Status: active - learning first UI target");
+    else
+        ImGui::TextUnformatted("Status: active - direct learned-target injection");
+
     ImGui::Spacing();
-    ImGui::TextWrapped("Diagnostic build: resource/descriptor/render-target hooks are disabled. FHX x86 Vulkan test build.");
+    ImGui::Text("Learned UI render targets: %u",
+                static_cast<unsigned int>(g_learnedUiTargets.size()));
+    ImGui::Text("Target learns: %llu",
+                static_cast<unsigned long long>(g_targetLearnEvents));
+    ImGui::Text("Target relearns: %llu",
+                static_cast<unsigned long long>(g_targetRelearnEvents));
+    ImGui::Text("Pre-UI effect renders: %llu",
+                static_cast<unsigned long long>(g_preUiRenders));
+    ImGui::Text("Presented frames: %llu",
+                static_cast<unsigned long long>(g_presentCount));
+
+    ImGui::Spacing();
+    ImGui::TextWrapped(
+        "FHX renders Primary UI into a full-resolution offscreen target rather "
+        "than directly into the swapchain. The first Primary-UI draw teaches "
+        "the add-on that target's resource, render-pass structure and local pass "
+        "occurrence. On later uses of that same target, enabled ReShade effects "
+        "are rendered immediately before the learned UI pass begins. This is "
+        "an active implementation; there is no multi-stage validation harness.");
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
-    switch (fdwReason) {
+} // namespace
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
+{
+    switch (reason)
+    {
         case DLL_PROCESS_ATTACH:
-            if (!reshade::register_addon(hModule)) {
+            if (!reshade::register_addon(hModule))
                 return FALSE;
-            }
 
-            g_dllPath = getModulePath(hModule);
-            g_addonUIData.SetBasePath(g_dllPath.parent_path());
-            g_addonUIData.LoadShaderTogglerIniFile();
-
-            // Safe-mode event set. Keep startup interception to the absolute minimum.
             reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
             reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::register_overlay(nullptr, &displayFHXSafeSettings);
+            reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
+            reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
+            reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
+            reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPass);
+            reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
+            reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
+            reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
+            reshade::register_overlay(nullptr, &displaySettings);
             break;
 
         case DLL_PROCESS_DETACH:
-            reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
+            reshade::unregister_overlay(nullptr, &displaySettings);
+            reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
+            reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
+            reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
+            reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPass);
+            reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
+            reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResource);
+            reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
-            reshade::unregister_overlay(nullptr, &displayFHXSafeSettings);
+            reshade::unregister_event<reshade::addon_event::init_pipeline>(onInitPipeline);
             reshade::unregister_addon(hModule);
             break;
     }
