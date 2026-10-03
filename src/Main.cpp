@@ -723,6 +723,7 @@ struct FHXPassSignature
 };
 
 static constexpr uint32_t kFHXSignatureStableFramesRequired = 20;
+static constexpr uint32_t kFHXValidationPresentsRequired = 60;
 static constexpr uint32_t kFHXWarmupSettledPresents = 30;
 
 static uint32_t g_fhxSelectedBoundaryTeacher = static_cast<uint32_t>(FHXBoundaryTeacher::primary_ui);
@@ -731,15 +732,38 @@ static std::unordered_map<command_list *, FHXPassSignature> g_fhxCurrentPassSign
 static std::unordered_map<command_list *, resource_view> g_fhxCurrentColorView;
 static std::unordered_map<uint64_t, uint32_t> g_fhxCurrentSignatureCounts;
 
+// Global pass numbers move between frames/command buffers in FHX.  Instead,
+// learn the teacher pass by its structural signature plus its occurrence on
+// that command list and the immediately preceding structural signature.
+static std::unordered_map<command_list *, std::unordered_map<uint64_t, uint32_t>> g_fhxLocalSignatureCounts;
+static std::unordered_map<command_list *, uint32_t> g_fhxCurrentPassLocalOccurrence;
+static std::unordered_map<command_list *, uint64_t> g_fhxCurrentPassPreviousSignatureKey;
+static std::unordered_map<command_list *, uint64_t> g_fhxLastPassSignatureKey;
+
 static FHXPassSignature g_fhxObservedTeacherSignature = {};
 static FHXPassSignature g_fhxLearnedSignature = {};
 static uint64_t g_fhxObservedTeacherSignatureKey = 0;
 static uint64_t g_fhxLearnedSignatureKey = 0;
+static uint32_t g_fhxObservedTeacherLocalOccurrence = 0;
+static uint32_t g_fhxLearnedTeacherLocalOccurrence = 0;
+static uint64_t g_fhxObservedTeacherPreviousSignatureKey = 0;
+static uint64_t g_fhxLearnedTeacherPreviousSignatureKey = 0;
 static uint32_t g_fhxSignatureStableFrames = 0;
 static uint32_t g_fhxLastSignatureOccurrences = 0;
 static uint64_t g_fhxSignatureChanges = 0;
 static uint64_t g_fhxTeacherObservations = 0;
 static uint64_t g_fhxSafeBoundaryHits = 0;
+
+// Before allowing any ReShade injection, validate the learned contextual
+// boundary for 60 presents with zero ReShade work.
+static bool g_fhxValidationActive = false;
+static bool g_fhxValidationAttempted = false;
+static bool g_fhxBoundaryValidated = false;
+static uint64_t g_fhxValidationStartSerial = 0;
+static uint64_t g_fhxValidationLastHitSerial = UINT64_MAX;
+static uint32_t g_fhxValidationUniqueHitFrames = 0;
+static uint32_t g_fhxValidationDuplicateHits = 0;
+static uint32_t g_fhxValidationMissedFrames = 0;
 
 static uint32_t g_fhxRequestedInjectionFrames = 0;
 static uint32_t g_fhxRemainingInjectionFrames = 0;
@@ -764,10 +788,10 @@ static const char *fhxBoundaryStatusText(FHXBoundaryInjectStatus status)
 {
     switch (status)
     {
-        case FHXBoundaryInjectStatus::disabled: return "learning structural UI-pass fingerprint";
-        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "fingerprint not stable yet";
+        case FHXBoundaryInjectStatus::disabled: return "learning contextual UI-pass fingerprint";
+        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "dry-run validating learned UI boundary";
         case FHXBoundaryInjectStatus::waiting_for_candidate: return "warm-up settling";
-        case FHXBoundaryInjectStatus::candidate_detected: return "stable unique pre-UI boundary ready";
+        case FHXBoundaryInjectStatus::candidate_detected: return "validated contextual pre-UI boundary ready";
         case FHXBoundaryInjectStatus::armed: return "test armed";
         case FHXBoundaryInjectStatus::no_runtime: return "no ReShade runtime";
         case FHXBoundaryInjectStatus::effects_disabled: return "ReShade effects disabled";
@@ -903,12 +927,42 @@ static bool isFullResolutionMainTargetFHX(const FHXRenderTargetInfo &rt)
            static_cast<reshade::api::format>(rt.formatValue) == reshade::api::format::b8g8r8a8_unorm;
 }
 
-static bool learnedFHXBoundaryReady()
+static bool learnedFHXBoundaryContextStable()
 {
     return g_fhxLearnedSignature.valid &&
            g_fhxLearnedSignatureKey != 0 &&
-           g_fhxSignatureStableFrames >= kFHXSignatureStableFramesRequired &&
-           g_fhxLastSignatureOccurrences == 1;
+           g_fhxLearnedTeacherLocalOccurrence != 0 &&
+           g_fhxSignatureStableFrames >= kFHXSignatureStableFramesRequired;
+}
+
+static bool learnedFHXBoundaryReady()
+{
+    return learnedFHXBoundaryContextStable() && g_fhxBoundaryValidated;
+}
+
+static void resetFHXValidation(bool clearAttempt)
+{
+    g_fhxValidationActive = false;
+    g_fhxBoundaryValidated = false;
+    g_fhxValidationStartSerial = 0;
+    g_fhxValidationLastHitSerial = UINT64_MAX;
+    g_fhxValidationUniqueHitFrames = 0;
+    g_fhxValidationDuplicateHits = 0;
+    g_fhxValidationMissedFrames = 0;
+    if (clearAttempt)
+        g_fhxValidationAttempted = false;
+}
+
+static void startFHXValidation()
+{
+    resetFHXValidation(false);
+    g_fhxValidationActive = true;
+    g_fhxValidationAttempted = true;
+    g_fhxValidationStartSerial = g_fhxPresentSerial;
+    g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_ui_prepass;
+    reshade::log::message(
+        reshade::log::level::info,
+        "[REST FHX] starting 60-present dry-run validation of contextual UI boundary");
 }
 
 static void resetFHXBoundaryTest()
@@ -937,9 +991,11 @@ static void queueFHXInjectionTest(uint32_t frameCount)
     g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
 
     const std::string msg = std::format(
-        "[REST FHX] queued structural-boundary test: teacher='{}', signature=0x{:016X}, frames={}",
+        "[REST FHX] queued structural-boundary test: teacher='{}', signature=0x{:016X}, local-occurrence={}, previous=0x{:016X}, frames={}",
         fhxBoundaryTeacherName(g_fhxSelectedBoundaryTeacher),
         g_fhxLearnedSignatureKey,
+        g_fhxLearnedTeacherLocalOccurrence,
+        g_fhxLearnedTeacherPreviousSignatureKey,
         frameCount);
     reshade::log::message(reshade::log::level::info, msg.c_str());
 }
@@ -1054,8 +1110,40 @@ static void onBeginRenderPassFHX(command_list *commandList,
         g_fhxCurrentColorView[commandList] = targetView;
         g_fhxCurrentPassSignature[commandList] = signature;
 
+        uint32_t localOccurrence = 0;
+        uint64_t previousSignatureKey = 0;
         if (signatureKey != 0)
+        {
             ++g_fhxCurrentSignatureCounts[signatureKey];
+            localOccurrence = ++g_fhxLocalSignatureCounts[commandList][signatureKey];
+
+            const auto previousIt = g_fhxLastPassSignatureKey.find(commandList);
+            if (previousIt != g_fhxLastPassSignatureKey.end())
+                previousSignatureKey = previousIt->second;
+
+            g_fhxCurrentPassLocalOccurrence[commandList] = localOccurrence;
+            g_fhxCurrentPassPreviousSignatureKey[commandList] = previousSignatureKey;
+            g_fhxLastPassSignatureKey[commandList] = signatureKey;
+        }
+
+        const bool contextMatches =
+            learnedFHXBoundaryContextStable() &&
+            sameFHXPassSignature(signature, g_fhxLearnedSignature) &&
+            localOccurrence == g_fhxLearnedTeacherLocalOccurrence &&
+            previousSignatureKey == g_fhxLearnedTeacherPreviousSignatureKey;
+
+        // Validation is intentionally passive: count whether this contextual
+        // boundary resolves exactly once per presented frame, then return.
+        if (g_fhxValidationActive && contextMatches)
+        {
+            if (g_fhxValidationLastHitSerial == g_fhxPresentSerial)
+                ++g_fhxValidationDuplicateHits;
+            else
+            {
+                g_fhxValidationLastHitSerial = g_fhxPresentSerial;
+                ++g_fhxValidationUniqueHitFrames;
+            }
+        }
 
         const bool testRequested =
             g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection || g_fhxWarmupPending;
@@ -1066,11 +1154,10 @@ static void onBeginRenderPassFHX(command_list *commandList,
         if (!learnedFHXBoundaryReady())
         {
             ++g_fhxSkippedUnstable;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_ui_prepass;
             return;
         }
 
-        if (!sameFHXPassSignature(signature, g_fhxLearnedSignature))
+        if (!contextMatches)
             return;
 
         ++g_fhxSafeBoundaryHits;
@@ -1214,6 +1301,10 @@ static void onResetCommandListFHX(command_list *commandList)
     g_fhxCurrentRenderTarget.erase(commandList);
     g_fhxCurrentColorView.erase(commandList);
     g_fhxCurrentPassSignature.erase(commandList);
+    g_fhxLocalSignatureCounts.erase(commandList);
+    g_fhxCurrentPassLocalOccurrence.erase(commandList);
+    g_fhxCurrentPassPreviousSignatureKey.erase(commandList);
+    g_fhxLastPassSignatureKey.erase(commandList);
 }
 
 static void onDestroyCommandListFHX(command_list *commandList)
@@ -1225,6 +1316,11 @@ static void onDestroyCommandListFHX(command_list *commandList)
     g_fhxActiveRenderPass.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
     g_fhxCurrentColorView.erase(commandList);
+    g_fhxCurrentPassSignature.erase(commandList);
+    g_fhxLocalSignatureCounts.erase(commandList);
+    g_fhxCurrentPassLocalOccurrence.erase(commandList);
+    g_fhxCurrentPassPreviousSignatureKey.erase(commandList);
+    g_fhxLastPassSignatureKey.erase(commandList);
 }
 
 static void onInitEffectRuntimeFHX(effect_runtime *runtime)
@@ -1297,6 +1393,15 @@ static void profileCurrentDrawFHX(command_list *commandList)
             {
                 g_fhxObservedTeacherSignature = sigIt->second;
                 g_fhxObservedTeacherSignatureKey = hashFHXPassSignature(sigIt->second);
+
+                const auto occurrenceIt = g_fhxCurrentPassLocalOccurrence.find(commandList);
+                g_fhxObservedTeacherLocalOccurrence =
+                    occurrenceIt != g_fhxCurrentPassLocalOccurrence.end() ? occurrenceIt->second : 0;
+
+                const auto previousIt = g_fhxCurrentPassPreviousSignatureKey.find(commandList);
+                g_fhxObservedTeacherPreviousSignatureKey =
+                    previousIt != g_fhxCurrentPassPreviousSignatureKey.end() ? previousIt->second : 0;
+
                 ++g_fhxTeacherObservations;
             }
         }
@@ -1356,18 +1461,23 @@ static void onReshadePresentFHX(effect_runtime *runtime)
         ++g_fhxProfiledFrame;
     }
 
-    if (g_fhxObservedTeacherSignature.valid && g_fhxObservedTeacherSignatureKey != 0)
+    if (g_fhxObservedTeacherSignature.valid &&
+        g_fhxObservedTeacherSignatureKey != 0 &&
+        g_fhxObservedTeacherLocalOccurrence != 0)
     {
         const auto countIt = g_fhxCurrentSignatureCounts.find(g_fhxObservedTeacherSignatureKey);
         const uint32_t occurrences =
             countIt != g_fhxCurrentSignatureCounts.end() ? countIt->second : 0;
 
-        if (sameFHXPassSignature(g_fhxObservedTeacherSignature, g_fhxLearnedSignature))
+        const bool sameBoundary =
+            sameFHXPassSignature(g_fhxObservedTeacherSignature, g_fhxLearnedSignature) &&
+            g_fhxObservedTeacherLocalOccurrence == g_fhxLearnedTeacherLocalOccurrence &&
+            g_fhxObservedTeacherPreviousSignatureKey == g_fhxLearnedTeacherPreviousSignatureKey;
+
+        if (sameBoundary)
         {
-            if (occurrences == 1 && g_fhxSignatureStableFrames < 0xFFFFFFFFu)
+            if (g_fhxSignatureStableFrames < 0xFFFFFFFFu)
                 ++g_fhxSignatureStableFrames;
-            else
-                g_fhxSignatureStableFrames = 0;
         }
         else
         {
@@ -1376,10 +1486,62 @@ static void onReshadePresentFHX(effect_runtime *runtime)
 
             g_fhxLearnedSignature = g_fhxObservedTeacherSignature;
             g_fhxLearnedSignatureKey = g_fhxObservedTeacherSignatureKey;
-            g_fhxSignatureStableFrames = occurrences == 1 ? 1u : 0u;
+            g_fhxLearnedTeacherLocalOccurrence = g_fhxObservedTeacherLocalOccurrence;
+            g_fhxLearnedTeacherPreviousSignatureKey = g_fhxObservedTeacherPreviousSignatureKey;
+            g_fhxSignatureStableFrames = 1;
+
+            // Any learned-boundary change invalidates an earlier dry-run result.
+            resetFHXValidation(true);
         }
 
         g_fhxLastSignatureOccurrences = occurrences;
+    }
+
+    // Automatic no-injection verification. This prevents another crash loop
+    // from a false-positive structural match.
+    if (g_fhxValidationActive)
+    {
+        const uint64_t elapsed =
+            g_fhxPresentSerial >= g_fhxValidationStartSerial
+            ? g_fhxPresentSerial - g_fhxValidationStartSerial
+            : 0;
+
+        if (elapsed >= kFHXValidationPresentsRequired)
+        {
+            g_fhxValidationActive = false;
+            g_fhxValidationMissedFrames =
+                g_fhxValidationUniqueHitFrames < kFHXValidationPresentsRequired
+                ? kFHXValidationPresentsRequired - g_fhxValidationUniqueHitFrames
+                : 0;
+
+            g_fhxBoundaryValidated =
+                g_fhxValidationUniqueHitFrames == kFHXValidationPresentsRequired &&
+                g_fhxValidationDuplicateHits == 0;
+
+            if (g_fhxBoundaryValidated)
+            {
+                g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
+                reshade::log::message(
+                    reshade::log::level::info,
+                    "[REST FHX] contextual UI boundary passed 60-present dry-run validation");
+            }
+            else
+            {
+                g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
+                const std::string msg = std::format(
+                    "[REST FHX] contextual UI boundary validation failed: hitFrames={}, missed={}, duplicates={}",
+                    g_fhxValidationUniqueHitFrames,
+                    g_fhxValidationMissedFrames,
+                    g_fhxValidationDuplicateHits);
+                reshade::log::message(reshade::log::level::warning, msg.c_str());
+            }
+        }
+    }
+    else if (learnedFHXBoundaryContextStable() &&
+             !g_fhxBoundaryValidated &&
+             !g_fhxValidationAttempted)
+    {
+        startFHXValidation();
     }
 
     if (g_fhxWarmupIssued && !g_fhxWarmupReady)
@@ -1400,7 +1562,9 @@ static void onReshadePresentFHX(effect_runtime *runtime)
             g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
         }
     }
-    else if (g_fhxRemainingInjectionFrames == 0 && !g_fhxContinuousInjection)
+    else if (g_fhxRemainingInjectionFrames == 0 &&
+             !g_fhxContinuousInjection &&
+             !g_fhxValidationActive)
     {
         g_fhxBoundaryInjectStatus = learnedFHXBoundaryReady()
             ? FHXBoundaryInjectStatus::candidate_detected
@@ -1411,8 +1575,14 @@ static void onReshadePresentFHX(effect_runtime *runtime)
     g_fhxCurrentShaderRTFrame.clear();
     g_fhxCurrentRTCatalog.clear();
     g_fhxCurrentSignatureCounts.clear();
+    g_fhxLocalSignatureCounts.clear();
+    g_fhxCurrentPassLocalOccurrence.clear();
+    g_fhxCurrentPassPreviousSignatureKey.clear();
+    g_fhxLastPassSignatureKey.clear();
     g_fhxObservedTeacherSignature = FHXPassSignature {};
     g_fhxObservedTeacherSignatureKey = 0;
+    g_fhxObservedTeacherLocalOccurrence = 0;
+    g_fhxObservedTeacherPreviousSignatureKey = 0;
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
 }
@@ -1511,8 +1681,16 @@ static void displayFHXHuntOverlay(effect_runtime *)
     uint64_t injectionCount = 0;
     uint64_t presentSerial = 0;
     uint64_t learnedSignatureKey = 0;
+    uint32_t learnedTeacherLocalOccurrence = 0;
+    uint64_t learnedTeacherPreviousSignatureKey = 0;
     uint32_t signatureStableFrames = 0;
     uint32_t lastSignatureOccurrences = 0;
+    bool validationActive = false;
+    bool validationAttempted = false;
+    bool boundaryValidated = false;
+    uint32_t validationUniqueHitFrames = 0;
+    uint32_t validationDuplicateHits = 0;
+    uint32_t validationMissedFrames = 0;
     uint64_t signatureChanges = 0;
     uint64_t teacherObservations = 0;
     uint64_t safeBoundaryHits = 0;
@@ -1548,7 +1726,15 @@ static void displayFHXHuntOverlay(effect_runtime *)
         injectionCount = g_fhxInjectionCount;
         presentSerial = g_fhxPresentSerial;
         learnedSignatureKey = g_fhxLearnedSignatureKey;
+        learnedTeacherLocalOccurrence = g_fhxLearnedTeacherLocalOccurrence;
+        learnedTeacherPreviousSignatureKey = g_fhxLearnedTeacherPreviousSignatureKey;
         signatureStableFrames = g_fhxSignatureStableFrames;
+        validationActive = g_fhxValidationActive;
+        validationAttempted = g_fhxValidationAttempted;
+        boundaryValidated = g_fhxBoundaryValidated;
+        validationUniqueHitFrames = g_fhxValidationUniqueHitFrames;
+        validationDuplicateHits = g_fhxValidationDuplicateHits;
+        validationMissedFrames = g_fhxValidationMissedFrames;
         lastSignatureOccurrences = g_fhxLastSignatureOccurrences;
         signatureChanges = g_fhxSignatureChanges;
         teacherObservations = g_fhxTeacherObservations;
@@ -1644,17 +1830,31 @@ static void displayFHXHuntOverlay(effect_runtime *)
         g_fhxLearnedSignature = FHXPassSignature {};
         g_fhxObservedTeacherSignatureKey = 0;
         g_fhxLearnedSignatureKey = 0;
+        g_fhxObservedTeacherLocalOccurrence = 0;
+        g_fhxLearnedTeacherLocalOccurrence = 0;
+        g_fhxObservedTeacherPreviousSignatureKey = 0;
+        g_fhxLearnedTeacherPreviousSignatureKey = 0;
         g_fhxSignatureStableFrames = 0;
         g_fhxLastSignatureOccurrences = 0;
+        resetFHXValidation(true);
         resetFHXBoundaryTest();
     }
 
     ImGui::Text("Status: %s", fhxBoundaryStatusText(harnessStatus));
-    ImGui::Text("Learned signature: 0x%016llX | stable %u/%u frames | occurrences last frame %u",
+    ImGui::Text("Learned signature: 0x%016llX | stable %u/%u frames",
                 static_cast<unsigned long long>(learnedSignatureKey),
                 signatureStableFrames,
-                kFHXSignatureStableFramesRequired,
-                lastSignatureOccurrences);
+                kFHXSignatureStableFramesRequired);
+    ImGui::Text("Context: occurrence %u of %u matching passes | previous signature 0x%016llX",
+                learnedTeacherLocalOccurrence,
+                lastSignatureOccurrences,
+                static_cast<unsigned long long>(learnedTeacherPreviousSignatureKey));
+    ImGui::Text("Dry-run validation: %s | hit frames %u/%u | missed %u | duplicate hits %u",
+                boundaryValidated ? "PASSED" : (validationActive ? "RUNNING" : (validationAttempted ? "FAILED" : "WAITING")),
+                validationUniqueHitFrames,
+                kFHXValidationPresentsRequired,
+                validationMissedFrames,
+                validationDuplicateHits);
     ImGui::Text("Teacher observations: %llu | signature changes: %llu | safe boundary hits: %llu",
                 static_cast<unsigned long long>(teacherObservations),
                 static_cast<unsigned long long>(signatureChanges),
@@ -1697,8 +1897,21 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     const bool boundaryReady =
         learnedSignature.valid &&
+        learnedTeacherLocalOccurrence != 0 &&
         signatureStableFrames >= kFHXSignatureStableFramesRequired &&
-        lastSignatureOccurrences == 1;
+        boundaryValidated;
+
+    if (validationAttempted && !validationActive && !boundaryValidated &&
+        learnedSignature.valid &&
+        learnedTeacherLocalOccurrence != 0 &&
+        signatureStableFrames >= kFHXSignatureStableFramesRequired)
+    {
+        if (ImGui::Button("Retry 60-frame dry-run"))
+        {
+            std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+            startFHXValidation();
+        }
+    }
 
     if (!boundaryReady)
         ImGui::BeginDisabled();
@@ -1754,12 +1967,12 @@ static void displayFHXHuntOverlay(effect_runtime *)
         ImGui::EndDisabled();
 
     ImGui::TextWrapped(
-        "The UI shader is now only a passive teacher. Its draw records the structural fingerprint "
-        "of the render pass it belongs to; no ReShade work is performed from draw callbacks. Once "
-        "that fingerprint is unique and stable for 20 frames, injection happens on a later frame "
-        "from begin_render_pass, before ReShade forwards vkCmdBeginRenderPass to Vulkan. Resource "
-        "handles and global pass numbers are deliberately excluded, so rotating command buffers "
-        "and scene-dependent pass numbering do not invalidate the boundary.");
+        "The UI shader is only a passive teacher. Because this pass type repeats many times per frame, "
+        "the learner now identifies it by structural signature + relative occurrence on the command "
+        "list + the immediately preceding structural signature. After 20 stable frames, a 60-present "
+        "dry-run automatically verifies that this contextual boundary resolves exactly once per frame. "
+        "Only after that passes are the injection tests unlocked. No ReShade work occurs from draw callbacks, "
+        "and global pass numbers/resource handles are deliberately excluded.");
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
