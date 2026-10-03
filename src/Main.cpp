@@ -18,32 +18,55 @@ namespace
 {
 constexpr uint32_t kPrimaryUiPixelShader = 0xCF49F7D6u;
 
+struct PassSignature
+{
+    bool valid = false;
+    uint32_t colorWidth = 0;
+    uint32_t colorHeight = 0;
+    uint32_t colorSamples = 0;
+    format colorFormat = format::unknown;
+    render_pass_load_op colorLoad = render_pass_load_op::load;
+    render_pass_store_op colorStore = render_pass_store_op::store;
+
+    bool hasDepth = false;
+    uint32_t depthWidth = 0;
+    uint32_t depthHeight = 0;
+    uint32_t depthSamples = 0;
+    format depthFormat = format::unknown;
+    render_pass_load_op depthLoad = render_pass_load_op::load;
+    render_pass_store_op depthStore = render_pass_store_op::store;
+};
+
+struct LearnedUiTarget
+{
+    PassSignature signature = {};
+    uint32_t localOccurrence = 0;
+};
+
 struct CommandState
 {
     bool insideRenderPass = false;
     resource_view currentRenderTarget = { 0 };
     resource currentRenderTargetResource = { 0 };
-
-    bool containsPrimaryUi = false;
-    resource_view primaryUiRenderTarget = { 0 };
-    resource primaryUiResource = { 0 };
+    PassSignature currentPassSignature = {};
+    uint32_t currentResourceOccurrence = 0;
+    std::unordered_map<uint64_t, uint32_t> resourcePassOccurrences;
 };
 
 std::mutex g_mutex;
 std::unordered_map<uint64_t, uint32_t> g_pixelShaderByPipeline;
 std::unordered_map<command_list *, CommandState> g_commandStates;
+std::unordered_map<uint64_t, LearnedUiTarget> g_learnedUiTargets;
 
 effect_runtime *g_runtime = nullptr;
 bool g_enabled = true;
+bool g_injectedThisPresent = false;
 
 thread_local bool g_insideManualRender = false;
 
-bool g_injectedThisPresent = false;
-
-uint64_t g_primaryUiCommandLists = 0;
-uint64_t g_preUiSubmissions = 0;
-uint64_t g_nonBackbufferUiSubmissions = 0;
-uint64_t g_wrongQueueSubmissions = 0;
+uint64_t g_targetLearnEvents = 0;
+uint64_t g_targetRelearnEvents = 0;
+uint64_t g_preUiRenders = 0;
 uint64_t g_presentCount = 0;
 
 uint32_t calculateShaderHash(const void *shaderData)
@@ -58,54 +81,96 @@ uint32_t calculateShaderHash(const void *shaderData)
     return compute_crc32(static_cast<const uint8_t *>(shader.code), shader.code_size);
 }
 
-bool isUsablePrimaryUiTarget(command_list *cmdList,
-                             uint32_t count,
-                             const render_pass_render_target_desc *rts)
+bool samePassSignature(const PassSignature &a, const PassSignature &b)
 {
+    return a.valid && b.valid &&
+           a.colorWidth == b.colorWidth &&
+           a.colorHeight == b.colorHeight &&
+           a.colorSamples == b.colorSamples &&
+           a.colorFormat == b.colorFormat &&
+           a.colorLoad == b.colorLoad &&
+           a.colorStore == b.colorStore &&
+           a.hasDepth == b.hasDepth &&
+           (!a.hasDepth ||
+            (a.depthWidth == b.depthWidth &&
+             a.depthHeight == b.depthHeight &&
+             a.depthSamples == b.depthSamples &&
+             a.depthFormat == b.depthFormat &&
+             a.depthLoad == b.depthLoad &&
+             a.depthStore == b.depthStore));
+}
+
+PassSignature buildPassSignature(command_list *cmdList,
+                                 uint32_t count,
+                                 const render_pass_render_target_desc *rts,
+                                 const render_pass_depth_stencil_desc *ds)
+{
+    PassSignature sig = {};
+
     if (cmdList == nullptr || count != 1 || rts == nullptr || rts[0].view.handle == 0)
-        return false;
-
-    effect_runtime *runtime = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        runtime = g_runtime;
-    }
-
-    if (runtime == nullptr || runtime->get_device() != cmdList->get_device())
-        return false;
-
-    uint32_t outputWidth = 0;
-    uint32_t outputHeight = 0;
-    runtime->get_screenshot_width_and_height(&outputWidth, &outputHeight);
-    if (outputWidth == 0 || outputHeight == 0)
-        return false;
+        return sig;
 
     device *dev = cmdList->get_device();
+    if (dev == nullptr)
+        return sig;
+
     const resource colorResource = dev->get_resource_from_view(rts[0].view);
     if (colorResource.handle == 0)
-        return false;
+        return sig;
 
-    const resource_desc desc = dev->get_resource_desc(colorResource);
-    if (desc.type != resource_type::texture_2d ||
-        desc.texture.width != outputWidth ||
-        desc.texture.height != outputHeight ||
-        desc.texture.samples != 1)
-        return false;
+    const resource_desc colorDesc = dev->get_resource_desc(colorResource);
+    if (colorDesc.type != resource_type::texture_2d)
+        return sig;
 
-    const resource_view_desc viewDesc = dev->get_resource_view_desc(rts[0].view);
-    const format fmt =
-        viewDesc.format != format::unknown ? viewDesc.format : desc.texture.format;
+    const resource_view_desc colorViewDesc = dev->get_resource_view_desc(rts[0].view);
 
-    switch (format_to_default_typed(fmt, 0))
+    sig.colorWidth = colorDesc.texture.width;
+    sig.colorHeight = colorDesc.texture.height;
+    sig.colorSamples = colorDesc.texture.samples;
+    sig.colorFormat =
+        colorViewDesc.format != format::unknown ? colorViewDesc.format : colorDesc.texture.format;
+    sig.colorLoad = rts[0].load_op;
+    sig.colorStore = rts[0].store_op;
+
+    if (ds != nullptr && ds->view.handle != 0)
     {
-        case format::r8g8b8a8_unorm:
-        case format::b8g8r8a8_unorm:
-        case format::r10g10b10a2_unorm:
-        case format::r16g16b16a16_float:
-            return true;
-        default:
-            return false;
+        const resource depthResource = dev->get_resource_from_view(ds->view);
+        if (depthResource.handle != 0)
+        {
+            const resource_desc depthDesc = dev->get_resource_desc(depthResource);
+            const resource_view_desc depthViewDesc = dev->get_resource_view_desc(ds->view);
+
+            if (depthDesc.type == resource_type::texture_2d)
+            {
+                sig.hasDepth = true;
+                sig.depthWidth = depthDesc.texture.width;
+                sig.depthHeight = depthDesc.texture.height;
+                sig.depthSamples = depthDesc.texture.samples;
+                sig.depthFormat =
+                    depthViewDesc.format != format::unknown ? depthViewDesc.format : depthDesc.texture.format;
+                sig.depthLoad = ds->depth_load_op;
+                sig.depthStore = ds->depth_store_op;
+            }
+        }
     }
+
+    sig.valid = true;
+    return sig;
+}
+
+bool isFullResolutionUiCandidate(effect_runtime *runtime, const PassSignature &sig)
+{
+    if (runtime == nullptr || !sig.valid || sig.colorSamples != 1)
+        return false;
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    runtime->get_screenshot_width_and_height(&width, &height);
+
+    return width != 0 &&
+           height != 0 &&
+           sig.colorWidth == width &&
+           sig.colorHeight == height;
 }
 
 void onInitPipeline(device *,
@@ -158,6 +223,15 @@ void onDestroyCommandList(command_list *cmdList)
     g_commandStates.erase(cmdList);
 }
 
+void onDestroyResource(device *, resource resourceHandle)
+{
+    if (resourceHandle.handle == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_learnedUiTargets.erase(resourceHandle.handle);
+}
+
 void onBindPipeline(command_list *cmdList, pipeline_stage stages, pipeline pipelineHandle)
 {
     if (g_insideManualRender || cmdList == nullptr || pipelineHandle.handle == 0)
@@ -173,33 +247,48 @@ void onBindPipeline(command_list *cmdList, pipeline_stage stages, pipeline pipel
         pipelineIt->second != kPrimaryUiPixelShader)
         return;
 
-    CommandState &state = g_commandStates[cmdList];
+    const auto stateIt = g_commandStates.find(cmdList);
+    if (stateIt == g_commandStates.end())
+        return;
 
-    // FHX/DXVK binds the Primary UI pipeline from inside the render pass.
-    // Capture the target that pass is rendering to and tag this command list.
-    if (state.insideRenderPass &&
-        state.currentRenderTarget.handle != 0 &&
-        state.currentRenderTargetResource.handle != 0)
+    const CommandState &state = stateIt->second;
+    if (!state.insideRenderPass ||
+        state.currentRenderTargetResource.handle == 0 ||
+        !state.currentPassSignature.valid ||
+        state.currentResourceOccurrence == 0)
+        return;
+
+    const uint64_t resourceHandle = state.currentRenderTargetResource.handle;
+    const LearnedUiTarget learned {
+        state.currentPassSignature,
+        state.currentResourceOccurrence
+    };
+
+    const auto learnedIt = g_learnedUiTargets.find(resourceHandle);
+    if (learnedIt == g_learnedUiTargets.end())
     {
-        if (!state.containsPrimaryUi)
-            ++g_primaryUiCommandLists;
-
-        state.containsPrimaryUi = true;
-        state.primaryUiRenderTarget = state.currentRenderTarget;
-        state.primaryUiResource = state.currentRenderTargetResource;
+        g_learnedUiTargets.emplace(resourceHandle, learned);
+        ++g_targetLearnEvents;
+    }
+    else if (!samePassSignature(learnedIt->second.signature, learned.signature) ||
+             learnedIt->second.localOccurrence != learned.localOccurrence)
+    {
+        learnedIt->second = learned;
+        ++g_targetRelearnEvents;
     }
 }
 
 void onBeginRenderPass(command_list *cmdList,
                        uint32_t count,
                        const render_pass_render_target_desc *rts,
-                       const render_pass_depth_stencil_desc *)
+                       const render_pass_depth_stencil_desc *ds)
 {
     if (g_insideManualRender || cmdList == nullptr)
         return;
 
     resource_view target = { 0 };
     resource targetResource = { 0 };
+    PassSignature signature = buildPassSignature(cmdList, count, rts, ds);
 
     if (count != 0 && rts != nullptr && rts[0].view.handle != 0)
     {
@@ -207,11 +296,63 @@ void onBeginRenderPass(command_list *cmdList,
         targetResource = cmdList->get_device()->get_resource_from_view(target);
     }
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    CommandState &state = g_commandStates[cmdList];
-    state.insideRenderPass = true;
-    state.currentRenderTarget = target;
-    state.currentRenderTargetResource = targetResource;
+    effect_runtime *runtime = nullptr;
+    uint32_t localOccurrence = 0;
+    bool shouldInject = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        CommandState &state = g_commandStates[cmdList];
+
+        if (targetResource.handle != 0)
+            localOccurrence = ++state.resourcePassOccurrences[targetResource.handle];
+
+        state.currentRenderTarget = target;
+        state.currentRenderTargetResource = targetResource;
+        state.currentPassSignature = signature;
+        state.currentResourceOccurrence = localOccurrence;
+
+        runtime = g_runtime;
+
+        if (g_enabled &&
+            !g_injectedThisPresent &&
+            runtime != nullptr &&
+            runtime->get_effects_state() &&
+            runtime->get_device() == cmdList->get_device() &&
+            target.handle != 0 &&
+            targetResource.handle != 0 &&
+            isFullResolutionUiCandidate(runtime, signature))
+        {
+            const auto learnedIt = g_learnedUiTargets.find(targetResource.handle);
+            if (learnedIt != g_learnedUiTargets.end() &&
+                learnedIt->second.localOccurrence == localOccurrence &&
+                samePassSignature(learnedIt->second.signature, signature))
+            {
+                shouldInject = true;
+            }
+        }
+    }
+
+    if (shouldInject)
+    {
+        // This is the actual pre-UI injection point. The target was learned
+        // from a previous Primary-UI draw on this exact render-target resource,
+        // render-pass structure and resource-local occurrence. No frame-global
+        // pass numbers, command-list identities or candidate ordering are used.
+        g_insideManualRender = true;
+        runtime->render_effects(cmdList, target, target);
+        g_insideManualRender = false;
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_injectedThisPresent = true;
+        ++g_preUiRenders;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_commandStates[cmdList].insideRenderPass = true;
+    }
 }
 
 void onEndRenderPass(command_list *cmdList)
@@ -224,85 +365,9 @@ void onEndRenderPass(command_list *cmdList)
     state.insideRenderPass = false;
     state.currentRenderTarget = { 0 };
     state.currentRenderTargetResource = { 0 };
+    state.currentPassSignature = {};
+    state.currentResourceOccurrence = 0;
 }
-
-void onExecuteCommandList(command_queue *queue, command_list *cmdList)
-{
-    if (g_insideManualRender || queue == nullptr || cmdList == nullptr)
-        return;
-
-    effect_runtime *runtime = nullptr;
-    resource_view uiTarget = { 0 };
-    resource uiResource = { 0 };
-    bool shouldInject = false;
-
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-
-        runtime = g_runtime;
-
-        const auto stateIt = g_commandStates.find(cmdList);
-        if (stateIt == g_commandStates.end() ||
-            !stateIt->second.containsPrimaryUi ||
-            g_injectedThisPresent)
-            return;
-
-        uiTarget = stateIt->second.primaryUiRenderTarget;
-        uiResource = stateIt->second.primaryUiResource;
-        shouldInject =
-            g_enabled &&
-            runtime != nullptr &&
-            runtime->get_effects_state() &&
-            uiTarget.handle != 0 &&
-            uiResource.handle != 0;
-    }
-
-    if (!shouldInject)
-        return;
-
-    // ReShade's Vulkan vkQueueSubmit hook invokes execute_command_list before
-    // submitting the application's command buffers. Any commands recorded on
-    // the queue's immediate list here are flushed by ReShade immediately
-    // before that application submit, inheriting its wait semaphores. This
-    // puts the effect pass on the GPU before the command buffer that contains
-    // FHX's Primary UI draw without predicting render-pass order.
-    if (runtime->get_command_queue() != queue)
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        ++g_wrongQueueSubmissions;
-        return;
-    }
-
-    const resource currentBackBuffer = runtime->get_current_back_buffer();
-    if (currentBackBuffer.handle == 0 ||
-        currentBackBuffer.handle != uiResource.handle)
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        ++g_nonBackbufferUiSubmissions;
-        return;
-    }
-
-    command_list *immediate = queue->get_immediate_command_list();
-    if (immediate == nullptr)
-        return;
-
-    // render_effects requires the supplied target to be in render_target
-    // state. The immediate submission waits on the application's acquire
-    // semaphore, then restores PRESENT before the application's UI command
-    // buffer is submitted.
-    g_insideManualRender = true;
-    immediate->barrier(uiResource, resource_usage::present, resource_usage::render_target);
-    runtime->render_effects(immediate, uiTarget, uiTarget);
-    immediate->barrier(uiResource, resource_usage::render_target, resource_usage::present);
-    g_insideManualRender = false;
-
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_injectedThisPresent = true;
-        ++g_preUiSubmissions;
-    }
-}
-
 
 void onInitEffectRuntime(effect_runtime *runtime)
 {
@@ -320,7 +385,11 @@ void onDestroyEffectRuntime(effect_runtime *runtime)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_runtime == runtime)
+    {
         g_runtime = nullptr;
+        g_learnedUiTargets.clear();
+        g_injectedThisPresent = false;
+    }
 }
 
 void onReshadePresent(effect_runtime *runtime)
@@ -347,29 +416,31 @@ void displaySettings(effect_runtime *)
         ImGui::TextUnformatted("Status: disabled");
     else if (g_runtime == nullptr)
         ImGui::TextUnformatted("Status: waiting for Vulkan runtime");
+    else if (g_learnedUiTargets.empty())
+        ImGui::TextUnformatted("Status: active - learning first UI target");
     else
-        ImGui::TextUnformatted("Status: active - submit-boundary injection");
+        ImGui::TextUnformatted("Status: active - direct learned-target injection");
 
     ImGui::Spacing();
-    ImGui::Text("Primary UI command lists seen: %llu",
-                static_cast<unsigned long long>(g_primaryUiCommandLists));
-    ImGui::Text("Pre-UI effect submissions: %llu",
-                static_cast<unsigned long long>(g_preUiSubmissions));
-    ImGui::Text("UI submissions not targeting swapchain: %llu",
-                static_cast<unsigned long long>(g_nonBackbufferUiSubmissions));
-    ImGui::Text("UI submissions on non-primary queue: %llu",
-                static_cast<unsigned long long>(g_wrongQueueSubmissions));
+    ImGui::Text("Learned UI render targets: %u",
+                static_cast<unsigned int>(g_learnedUiTargets.size()));
+    ImGui::Text("Target learns: %llu",
+                static_cast<unsigned long long>(g_targetLearnEvents));
+    ImGui::Text("Target relearns: %llu",
+                static_cast<unsigned long long>(g_targetRelearnEvents));
+    ImGui::Text("Pre-UI effect renders: %llu",
+                static_cast<unsigned long long>(g_preUiRenders));
     ImGui::Text("Presented frames: %llu",
                 static_cast<unsigned long long>(g_presentCount));
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "FHX binds its Primary UI shader from inside a Vulkan render pass, so "
-        "the add-on tags the command buffer while it is being recorded. When "
-        "that command buffer is later submitted, enabled ReShade effects are "
-        "recorded onto ReShade's immediate Vulkan command list and ordered "
-        "before the FHX UI submission. This is an active implementation; it "
-        "does not learn or predict render-pass hashes.");
+        "FHX renders Primary UI into a full-resolution offscreen target rather "
+        "than directly into the swapchain. The first Primary-UI draw teaches "
+        "the add-on that target's resource, render-pass structure and local pass "
+        "occurrence. On later uses of that same target, enabled ReShade effects "
+        "are rendered immediately before the learned UI pass begins. This is "
+        "an active implementation; there is no multi-stage validation harness.");
 }
 
 } // namespace
@@ -386,10 +457,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             reshade::register_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
+            reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
             reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
             reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPass);
-            reshade::register_event<reshade::addon_event::execute_command_list>(onExecuteCommandList);
             reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
             reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
@@ -401,10 +472,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
-            reshade::unregister_event<reshade::addon_event::execute_command_list>(onExecuteCommandList);
             reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPass);
             reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResource);
             reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::unregister_event<reshade::addon_event::destroy_pipeline>(onDestroyPipeline);
