@@ -21,8 +21,12 @@ constexpr uint32_t kPrimaryUiPixelShader = 0xCF49F7D6u;
 struct CommandState
 {
     bool insideRenderPass = false;
-    bool pendingPrimaryUiBoundary = false;
-    bool injectedThisRecording = false;
+    resource_view currentRenderTarget = { 0 };
+    resource currentRenderTargetResource = { 0 };
+
+    bool containsPrimaryUi = false;
+    resource_view primaryUiRenderTarget = { 0 };
+    resource primaryUiResource = { 0 };
 };
 
 std::mutex g_mutex;
@@ -34,10 +38,12 @@ bool g_enabled = true;
 
 thread_local bool g_insideManualRender = false;
 
-uint64_t g_primaryUiBindsOutsidePass = 0;
-uint64_t g_primaryUiBindsInsidePass = 0;
-uint64_t g_preUiRenders = 0;
-uint64_t g_rejectedBoundaries = 0;
+bool g_injectedThisPresent = false;
+
+uint64_t g_primaryUiCommandLists = 0;
+uint64_t g_preUiSubmissions = 0;
+uint64_t g_nonBackbufferUiSubmissions = 0;
+uint64_t g_wrongQueueSubmissions = 0;
 uint64_t g_presentCount = 0;
 
 uint32_t calculateShaderHash(const void *shaderData)
@@ -169,14 +175,19 @@ void onBindPipeline(command_list *cmdList, pipeline_stage stages, pipeline pipel
 
     CommandState &state = g_commandStates[cmdList];
 
-    if (state.insideRenderPass)
+    // FHX/DXVK binds the Primary UI pipeline from inside the render pass.
+    // Capture the target that pass is rendering to and tag this command list.
+    if (state.insideRenderPass &&
+        state.currentRenderTarget.handle != 0 &&
+        state.currentRenderTargetResource.handle != 0)
     {
-        ++g_primaryUiBindsInsidePass;
-        return;
-    }
+        if (!state.containsPrimaryUi)
+            ++g_primaryUiCommandLists;
 
-    state.pendingPrimaryUiBoundary = true;
-    ++g_primaryUiBindsOutsidePass;
+        state.containsPrimaryUi = true;
+        state.primaryUiRenderTarget = state.currentRenderTarget;
+        state.primaryUiResource = state.currentRenderTargetResource;
+    }
 }
 
 void onBeginRenderPass(command_list *cmdList,
@@ -187,64 +198,20 @@ void onBeginRenderPass(command_list *cmdList,
     if (g_insideManualRender || cmdList == nullptr)
         return;
 
-    bool shouldAttempt = false;
+    resource_view target = { 0 };
+    resource targetResource = { 0 };
 
+    if (count != 0 && rts != nullptr && rts[0].view.handle != 0)
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        CommandState &state = g_commandStates[cmdList];
-
-        shouldAttempt =
-            g_enabled &&
-            state.pendingPrimaryUiBoundary &&
-            !state.injectedThisRecording;
+        target = rts[0].view;
+        targetResource = cmdList->get_device()->get_resource_from_view(target);
     }
 
-    if (shouldAttempt)
-    {
-        effect_runtime *runtime = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            runtime = g_runtime;
-        }
-
-        if (runtime != nullptr &&
-            runtime->get_effects_state() &&
-            runtime->get_device() == cmdList->get_device() &&
-            isUsablePrimaryUiTarget(cmdList, count, rts))
-        {
-            // ReShade calls this add-on event before forwarding the game's
-            // vkCmdBeginRenderPass/vkCmdBeginRendering. The command list is
-            // therefore outside the application render pass here.
-            //
-            // effect_runtime::render_effects performs its own state capture and
-            // restoration for out-of-present rendering and marks effects as
-            // rendered for the frame, so the normal end-of-frame pass will not
-            // apply the same effects a second time.
-            g_insideManualRender = true;
-            runtime->render_effects(cmdList, rts[0].view, rts[0].view);
-            g_insideManualRender = false;
-
-            std::lock_guard<std::mutex> lock(g_mutex);
-            CommandState &state = g_commandStates[cmdList];
-            state.pendingPrimaryUiBoundary = false;
-            state.injectedThisRecording = true;
-            ++g_preUiRenders;
-        }
-        else
-        {
-            // Keep the pending boundary alive for the next render pass on this
-            // same command list. Pipeline binds may legally happen several
-            // commands before the actual UI render pass begins.
-            std::lock_guard<std::mutex> lock(g_mutex);
-            ++g_rejectedBoundaries;
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_commandStates[cmdList].insideRenderPass = true;
-    }
-
+    std::lock_guard<std::mutex> lock(g_mutex);
+    CommandState &state = g_commandStates[cmdList];
+    state.insideRenderPass = true;
+    state.currentRenderTarget = target;
+    state.currentRenderTargetResource = targetResource;
 }
 
 void onEndRenderPass(command_list *cmdList)
@@ -253,8 +220,89 @@ void onEndRenderPass(command_list *cmdList)
         return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_commandStates[cmdList].insideRenderPass = false;
+    CommandState &state = g_commandStates[cmdList];
+    state.insideRenderPass = false;
+    state.currentRenderTarget = { 0 };
+    state.currentRenderTargetResource = { 0 };
 }
+
+void onExecuteCommandList(command_queue *queue, command_list *cmdList)
+{
+    if (g_insideManualRender || queue == nullptr || cmdList == nullptr)
+        return;
+
+    effect_runtime *runtime = nullptr;
+    resource_view uiTarget = { 0 };
+    resource uiResource = { 0 };
+    bool shouldInject = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        runtime = g_runtime;
+
+        const auto stateIt = g_commandStates.find(cmdList);
+        if (stateIt == g_commandStates.end() ||
+            !stateIt->second.containsPrimaryUi ||
+            g_injectedThisPresent)
+            return;
+
+        uiTarget = stateIt->second.primaryUiRenderTarget;
+        uiResource = stateIt->second.primaryUiResource;
+        shouldInject =
+            g_enabled &&
+            runtime != nullptr &&
+            runtime->get_effects_state() &&
+            uiTarget.handle != 0 &&
+            uiResource.handle != 0;
+    }
+
+    if (!shouldInject)
+        return;
+
+    // ReShade's Vulkan vkQueueSubmit hook invokes execute_command_list before
+    // submitting the application's command buffers. Any commands recorded on
+    // the queue's immediate list here are flushed by ReShade immediately
+    // before that application submit, inheriting its wait semaphores. This
+    // puts the effect pass on the GPU before the command buffer that contains
+    // FHX's Primary UI draw without predicting render-pass order.
+    if (runtime->get_command_queue() != queue)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ++g_wrongQueueSubmissions;
+        return;
+    }
+
+    const resource currentBackBuffer = runtime->get_current_back_buffer();
+    if (currentBackBuffer.handle == 0 ||
+        currentBackBuffer.handle != uiResource.handle)
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ++g_nonBackbufferUiSubmissions;
+        return;
+    }
+
+    command_list *immediate = queue->get_immediate_command_list();
+    if (immediate == nullptr)
+        return;
+
+    // render_effects requires the supplied target to be in render_target
+    // state. The immediate submission waits on the application's acquire
+    // semaphore, then restores PRESENT before the application's UI command
+    // buffer is submitted.
+    g_insideManualRender = true;
+    immediate->barrier(uiResource, resource_usage::present, resource_usage::render_target);
+    runtime->render_effects(immediate, uiTarget, uiTarget);
+    immediate->barrier(uiResource, resource_usage::render_target, resource_usage::present);
+    g_insideManualRender = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_injectedThisPresent = true;
+        ++g_preUiSubmissions;
+    }
+}
+
 
 void onInitEffectRuntime(effect_runtime *runtime)
 {
@@ -280,13 +328,10 @@ void onReshadePresent(effect_runtime *runtime)
     std::lock_guard<std::mutex> lock(g_mutex);
 
     if (runtime == g_runtime)
+    {
         ++g_presentCount;
-
-    // Do not carry an unresolved pre-UI trigger into a later presented frame.
-    // Command-list reset will normally clear this first on Vulkan, but this is
-    // a conservative safety net for unusual reuse patterns.
-    for (auto &[cmdList, state] : g_commandStates)
-        state.pendingPrimaryUiBoundary = false;
+        g_injectedThisPresent = false;
+    }
 }
 
 void displaySettings(effect_runtime *)
@@ -303,28 +348,30 @@ void displaySettings(effect_runtime *)
     else if (g_runtime == nullptr)
         ImGui::TextUnformatted("Status: waiting for Vulkan runtime");
     else
-        ImGui::TextUnformatted("Status: active");
+        ImGui::TextUnformatted("Status: active - submit-boundary injection");
 
     ImGui::Spacing();
-    ImGui::Text("Pre-UI effect renders: %llu",
-                static_cast<unsigned long long>(g_preUiRenders));
-    ImGui::Text("Primary UI binds before render pass: %llu",
-                static_cast<unsigned long long>(g_primaryUiBindsOutsidePass));
-    ImGui::Text("Primary UI binds inside render pass: %llu",
-                static_cast<unsigned long long>(g_primaryUiBindsInsidePass));
-    ImGui::Text("Rejected candidate passes: %llu",
-                static_cast<unsigned long long>(g_rejectedBoundaries));
+    ImGui::Text("Primary UI command lists seen: %llu",
+                static_cast<unsigned long long>(g_primaryUiCommandLists));
+    ImGui::Text("Pre-UI effect submissions: %llu",
+                static_cast<unsigned long long>(g_preUiSubmissions));
+    ImGui::Text("UI submissions not targeting swapchain: %llu",
+                static_cast<unsigned long long>(g_nonBackbufferUiSubmissions));
+    ImGui::Text("UI submissions on non-primary queue: %llu",
+                static_cast<unsigned long long>(g_wrongQueueSubmissions));
     ImGui::Text("Presented frames: %llu",
                 static_cast<unsigned long long>(g_presentCount));
 
     ImGui::Spacing();
     ImGui::TextWrapped(
-        "This is an active FHX-specific implementation, not a learning or "
-        "diagnostic harness. When the known Primary UI pixel shader is bound "
-        "outside a Vulkan render pass, the add-on renders the currently enabled "
-        "ReShade effect chain into the next matching full-resolution color pass "
-        "on that same command list before the game's UI pass begins.");
+        "FHX binds its Primary UI shader from inside a Vulkan render pass, so "
+        "the add-on tags the command buffer while it is being recorded. When "
+        "that command buffer is later submitted, enabled ReShade effects are "
+        "recorded onto ReShade's immediate Vulkan command list and ordered "
+        "before the FHX UI submission. This is an active implementation; it "
+        "does not learn or predict render-pass hashes.");
 }
+
 } // namespace
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
@@ -342,6 +389,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
             reshade::register_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
             reshade::register_event<reshade::addon_event::end_render_pass>(onEndRenderPass);
+            reshade::register_event<reshade::addon_event::execute_command_list>(onExecuteCommandList);
             reshade::register_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
             reshade::register_event<reshade::addon_event::reshade_present>(onReshadePresent);
@@ -353,6 +401,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
             reshade::unregister_event<reshade::addon_event::reshade_present>(onReshadePresent);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(onDestroyEffectRuntime);
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(onInitEffectRuntime);
+            reshade::unregister_event<reshade::addon_event::execute_command_list>(onExecuteCommandList);
             reshade::unregister_event<reshade::addon_event::end_render_pass>(onEndRenderPass);
             reshade::unregister_event<reshade::addon_event::begin_render_pass>(onBeginRenderPass);
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipeline);
