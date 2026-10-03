@@ -1,4 +1,15 @@
-# ReshadeEffectShaderToggler [![MSBuild](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/msbuild.yml/badge.svg)](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/msbuild.yml) [![Release](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/release.yml/badge.svg)](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/release.yml)
+# ReshadeEffectShaderToggler
+
+> ## FHX Restoration UI Mask
+> This repository also hosts the standalone **FHX Restoration ReShade UI Mask**.
+> It is a screen-space HUD restore shader that keeps ReShade post-processing off
+> the fixed FHX UI without requiring shader interception.
+>
+> **Current version:** v4.5  
+> **Files and setup:** [FHX-UIMask/README.md](FHX-UIMask/README.md)  
+> **Shader:** [FHX-UIMask/Shaders/FHX_UIMaskv4.5.fx](FHX-UIMask/Shaders/FHX_UIMaskv4.5.fx)
+
+[![MSBuild](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/msbuild.yml/badge.svg)](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/msbuild.yml) [![Release](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/release.yml/badge.svg)](https://github.com/4lex4nder/ReshadeEffectShaderToggler/actions/workflows/release.yml)
 Reshade 5.8+ addon to apply Reshade effects to render targets bound before specific, user-configurable, groups of shaders are 
 encountered within a game's rendering pipeline.
 
