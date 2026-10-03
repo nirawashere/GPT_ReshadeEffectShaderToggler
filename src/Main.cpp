@@ -723,7 +723,7 @@ struct FHXPassSignature
 };
 
 static constexpr uint32_t kFHXSignatureStableFramesRequired = 20;
-static constexpr uint32_t kFHXOwnerReuseValidationRequired = 60;
+static constexpr uint32_t kFHXTargetValidationFramesRequired = 60;
 static constexpr uint32_t kFHXWarmupSettledPresents = 30;
 
 static uint32_t g_fhxSelectedBoundaryTeacher = static_cast<uint32_t>(FHXBoundaryTeacher::primary_ui);
@@ -740,17 +740,22 @@ static std::unordered_map<command_list *, uint32_t> g_fhxCurrentPassLocalOccurre
 static std::unordered_map<command_list *, uint64_t> g_fhxCurrentPassPreviousSignatureKey;
 static std::unordered_map<command_list *, uint64_t> g_fhxLastPassSignatureKey;
 
-struct FHXUiOwnerState
-{
-    uint64_t generation = 0;
-    bool uiOwner = false;
-    uint64_t learnedGeneration = 0;
-    uint64_t lastPredictedGeneration = 0;
-    uint64_t lastTeacherGeneration = 0;
-    uint64_t lastConfirmedGeneration = 0;
-};
+// Stage 2 learns session-local render-target resources, not command-list
+// identity. Resource handles are removed immediately on destroy_resource.
+static std::unordered_set<uint64_t> g_fhxUiTargetResources;
 
-static std::unordered_map<command_list *, FHXUiOwnerState> g_fhxUiOwnerStates;
+// Per-frame passive correlation between the predicted pre-UI boundary and the
+// later Primary UI teacher draw. Command-list pointers are transient only.
+static uint32_t g_fhxTargetPredictionCountThisFrame = 0;
+static command_list *g_fhxPredictedCommandListThisFrame = nullptr;
+static uint64_t g_fhxPredictedResourceThisFrame = 0;
+static uint64_t g_fhxPredictedViewThisFrame = 0;
+static std::unordered_set<uint64_t> g_fhxPredictedResourcesThisFrame;
+static bool g_fhxTargetTeacherSeenThisFrame = false;
+static bool g_fhxTargetTeacherWasKnownThisFrame = false;
+static bool g_fhxTargetTeacherConfirmedThisFrame = false;
+static uint64_t g_fhxTeacherResourceThisFrame = 0;
+static uint64_t g_fhxTeacherViewThisFrame = 0;
 
 static FHXPassSignature g_fhxObservedTeacherSignature = {};
 static FHXPassSignature g_fhxLearnedSignature = {};
@@ -767,16 +772,16 @@ static uint64_t g_fhxSignatureChanges = 0;
 static uint64_t g_fhxTeacherObservations = 0;
 static uint64_t g_fhxSafeBoundaryHits = 0;
 
-// Stage 2 validates the session-local command-list objects that actually own
-// Primary UI work. Pointers are never persisted and are erased on destruction.
-static uint32_t g_fhxOwnerValidationStreak = 0;
-static bool g_fhxOwnerValidationPassed = false;
-static uint64_t g_fhxOwnerLearnEvents = 0;
-static uint64_t g_fhxOwnerPredictions = 0;
-static uint64_t g_fhxOwnerConfirmations = 0;
-static uint64_t g_fhxOwnerFalsePredictions = 0;
-static uint64_t g_fhxOwnerMissedPredictions = 0;
-static uint64_t g_fhxOwnerRoleChanges = 0;
+static uint32_t g_fhxTargetValidationStreak = 0;
+static bool g_fhxTargetValidationPassed = false;
+static uint64_t g_fhxTargetLearnEvents = 0;
+static uint64_t g_fhxTargetDestroyEvents = 0;
+static uint64_t g_fhxTargetPredictions = 0;
+static uint64_t g_fhxTargetConfirmations = 0;
+static uint64_t g_fhxTargetFalsePredictions = 0;
+static uint64_t g_fhxTargetMissedPredictions = 0;
+static uint64_t g_fhxTargetDuplicatePredictions = 0;
+static uint64_t g_fhxTargetRoleChanges = 0;
 
 static uint32_t g_fhxRequestedInjectionFrames = 0;
 static uint32_t g_fhxRemainingInjectionFrames = 0;
@@ -801,10 +806,10 @@ static const char *fhxBoundaryStatusText(FHXBoundaryInjectStatus status)
 {
     switch (status)
     {
-        case FHXBoundaryInjectStatus::disabled: return "learning base / UI-owner command-list reuse";
-        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "validating UI-owner command-list reuse";
+        case FHXBoundaryInjectStatus::disabled: return "learning base / Primary-UI render target";
+        case FHXBoundaryInjectStatus::waiting_for_ui_prepass: return "validating Primary-UI render target";
         case FHXBoundaryInjectStatus::waiting_for_candidate: return "warm-up settling";
-        case FHXBoundaryInjectStatus::candidate_detected: return "validated UI-owner pre-pass boundary ready";
+        case FHXBoundaryInjectStatus::candidate_detected: return "validated target-bound pre-UI boundary ready";
         case FHXBoundaryInjectStatus::armed: return "test armed";
         case FHXBoundaryInjectStatus::no_runtime: return "no ReShade runtime";
         case FHXBoundaryInjectStatus::effects_disabled: return "ReShade effects disabled";
@@ -948,49 +953,42 @@ static bool learnedFHXBaseContextStable()
            g_fhxBaseStableFrames >= kFHXSignatureStableFramesRequired;
 }
 
-static uint32_t countKnownFHXUiOwnersUnsafe()
+static uint32_t countKnownFHXUiTargetsUnsafe()
 {
-    uint32_t count = 0;
-    for (const auto &[commandList, state] : g_fhxUiOwnerStates)
-        if (commandList != nullptr && state.uiOwner)
-            ++count;
-    return count;
+    return static_cast<uint32_t>(g_fhxUiTargetResources.size());
 }
 
-static FHXUiOwnerState &getFHXUiOwnerStateUnsafe(command_list *commandList)
+static void invalidateFHXTargetValidationUnsafe()
 {
-    FHXUiOwnerState &state = g_fhxUiOwnerStates[commandList];
-    if (state.generation == 0)
-        state.generation = 1;
-    return state;
+    g_fhxTargetValidationStreak = 0;
+    g_fhxTargetValidationPassed = false;
 }
 
-static void invalidateFHXOwnerValidationUnsafe()
+static bool currentFHXPassMatchesLearnedBaseUnsafe(
+    command_list *commandList,
+    const FHXPassSignature &signature)
 {
-    g_fhxOwnerValidationStreak = 0;
-    g_fhxOwnerValidationPassed = false;
-}
+    if (!learnedFHXBaseContextStable() || commandList == nullptr)
+        return false;
 
-static void confirmFHXOwnerReuseUnsafe(FHXUiOwnerState &state)
-{
-    if (state.lastConfirmedGeneration == state.generation)
-        return;
+    const auto occurrenceIt = g_fhxCurrentPassLocalOccurrence.find(commandList);
+    const auto previousIt = g_fhxCurrentPassPreviousSignatureKey.find(commandList);
 
-    state.lastConfirmedGeneration = state.generation;
-    ++g_fhxOwnerConfirmations;
+    const uint32_t localOccurrence =
+        occurrenceIt != g_fhxCurrentPassLocalOccurrence.end() ? occurrenceIt->second : 0;
+    const uint64_t previousSignatureKey =
+        previousIt != g_fhxCurrentPassPreviousSignatureKey.end() ? previousIt->second : 0;
 
-    if (g_fhxOwnerValidationStreak < 0xFFFFFFFFu)
-        ++g_fhxOwnerValidationStreak;
-
-    if (g_fhxOwnerValidationStreak >= kFHXOwnerReuseValidationRequired)
-        g_fhxOwnerValidationPassed = true;
+    return sameFHXPassSignature(signature, g_fhxLearnedSignature) &&
+           localOccurrence == g_fhxLearnedTeacherLocalOccurrence &&
+           previousSignatureKey == g_fhxLearnedTeacherPreviousSignatureKey;
 }
 
 static bool learnedFHXBoundaryReady()
 {
     return learnedFHXBaseContextStable() &&
-           countKnownFHXUiOwnersUnsafe() != 0 &&
-           g_fhxOwnerValidationPassed;
+           countKnownFHXUiTargetsUnsafe() != 0 &&
+           g_fhxTargetValidationPassed;
 }
 
 static void resetFHXBoundaryTest()
@@ -1019,13 +1017,13 @@ static void queueFHXInjectionTest(uint32_t frameCount)
     g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
 
     const std::string msg = std::format(
-        "[REST FHX] queued owner-reuse boundary test: teacher='{}', signature=0x{:016X}, local-occurrence={}, previous=0x{:016X}, owners={}, validation-streak={}, frames={}",
+        "[REST FHX] queued target-boundary test: teacher='{}', signature=0x{:016X}, local-occurrence={}, previous=0x{:016X}, targets={}, validation-streak={}, frames={}",
         fhxBoundaryTeacherName(g_fhxSelectedBoundaryTeacher),
         g_fhxLearnedSignatureKey,
         g_fhxLearnedTeacherLocalOccurrence,
         g_fhxLearnedTeacherPreviousSignatureKey,
-        countKnownFHXUiOwnersUnsafe(),
-        g_fhxOwnerValidationStreak,
+        countKnownFHXUiTargetsUnsafe(),
+        g_fhxTargetValidationStreak,
         frameCount);
     reshade::log::message(reshade::log::level::info, msg.c_str());
 }
@@ -1156,23 +1154,30 @@ static void onBeginRenderPassFHX(command_list *commandList,
             g_fhxLastPassSignatureKey[commandList] = signatureKey;
         }
 
-        FHXUiOwnerState &owner = getFHXUiOwnerStateUnsafe(commandList);
-
         const bool baseContextMatches =
             learnedFHXBaseContextStable() &&
             sameFHXPassSignature(signature, g_fhxLearnedSignature) &&
             localOccurrence == g_fhxLearnedTeacherLocalOccurrence &&
             previousSignatureKey == g_fhxLearnedTeacherPreviousSignatureKey;
 
-        bool ownerPrediction = false;
-        if (baseContextMatches &&
-            owner.uiOwner &&
-            owner.generation > owner.learnedGeneration &&
-            owner.lastPredictedGeneration != owner.generation)
+        const bool targetKnown =
+            rt.valid &&
+            rt.resourceHandle != 0 &&
+            g_fhxUiTargetResources.find(rt.resourceHandle) != g_fhxUiTargetResources.end();
+
+        const bool targetPrediction = baseContextMatches && targetKnown;
+        if (targetPrediction)
         {
-            owner.lastPredictedGeneration = owner.generation;
-            ++g_fhxOwnerPredictions;
-            ownerPrediction = true;
+            ++g_fhxTargetPredictions;
+            ++g_fhxTargetPredictionCountThisFrame;
+            g_fhxPredictedResourcesThisFrame.insert(rt.resourceHandle);
+
+            if (g_fhxTargetPredictionCountThisFrame == 1)
+            {
+                g_fhxPredictedCommandListThisFrame = commandList;
+                g_fhxPredictedResourceThisFrame = rt.resourceHandle;
+                g_fhxPredictedViewThisFrame = rt.viewHandle;
+            }
         }
 
         const bool testRequested =
@@ -1187,7 +1192,7 @@ static void onBeginRenderPassFHX(command_list *commandList,
             return;
         }
 
-        if (!ownerPrediction)
+        if (!targetPrediction)
             return;
 
         ++g_fhxSafeBoundaryHits;
@@ -1325,22 +1330,6 @@ static void onResetCommandListFHX(command_list *commandList)
         return;
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-    FHXUiOwnerState &owner = getFHXUiOwnerStateUnsafe(commandList);
-
-    if (owner.uiOwner &&
-        owner.generation > owner.learnedGeneration &&
-        owner.lastPredictedGeneration == owner.generation &&
-        owner.lastTeacherGeneration != owner.generation)
-    {
-        ++g_fhxOwnerFalsePredictions;
-        ++g_fhxOwnerRoleChanges;
-        owner.uiOwner = false;
-        owner.learnedGeneration = 0;
-        invalidateFHXOwnerValidationUnsafe();
-    }
-
-    ++owner.generation;
-
     g_fhxActiveRenderPass.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
     g_fhxCurrentColorView.erase(commandList);
@@ -1357,23 +1346,6 @@ static void onDestroyCommandListFHX(command_list *commandList)
         return;
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-
-    const auto ownerIt = g_fhxUiOwnerStates.find(commandList);
-    if (ownerIt != g_fhxUiOwnerStates.end())
-    {
-        const FHXUiOwnerState &owner = ownerIt->second;
-        if (owner.uiOwner &&
-            owner.generation > owner.learnedGeneration &&
-            owner.lastPredictedGeneration == owner.generation &&
-            owner.lastTeacherGeneration != owner.generation)
-        {
-            ++g_fhxOwnerFalsePredictions;
-            ++g_fhxOwnerRoleChanges;
-            invalidateFHXOwnerValidationUnsafe();
-        }
-        g_fhxUiOwnerStates.erase(ownerIt);
-    }
-
     g_fhxActiveRenderPass.erase(commandList);
     g_fhxCurrentRenderTarget.erase(commandList);
     g_fhxCurrentColorView.erase(commandList);
@@ -1382,6 +1354,35 @@ static void onDestroyCommandListFHX(command_list *commandList)
     g_fhxCurrentPassLocalOccurrence.erase(commandList);
     g_fhxCurrentPassPreviousSignatureKey.erase(commandList);
     g_fhxLastPassSignatureKey.erase(commandList);
+}
+
+static void onDestroyResourceFHX(device *, resource resourceHandle)
+{
+    if (resourceHandle.handle == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+    if (g_fhxUiTargetResources.erase(resourceHandle.handle) != 0)
+    {
+        ++g_fhxTargetDestroyEvents;
+        invalidateFHXTargetValidationUnsafe();
+    }
+
+    g_fhxPredictedResourcesThisFrame.erase(resourceHandle.handle);
+    if (g_fhxPredictedResourceThisFrame == resourceHandle.handle)
+    {
+        g_fhxPredictedCommandListThisFrame = nullptr;
+        g_fhxPredictedResourceThisFrame = 0;
+        g_fhxPredictedViewThisFrame = 0;
+    }
+    if (g_fhxTeacherResourceThisFrame == resourceHandle.handle)
+    {
+        g_fhxTargetTeacherSeenThisFrame = false;
+        g_fhxTargetTeacherWasKnownThisFrame = false;
+        g_fhxTargetTeacherConfirmedThisFrame = false;
+        g_fhxTeacherResourceThisFrame = 0;
+        g_fhxTeacherViewThisFrame = 0;
+    }
 }
 
 static void onInitEffectRuntimeFHX(effect_runtime *runtime)
@@ -1405,6 +1406,18 @@ static void onDestroyEffectRuntimeFHX(effect_runtime *runtime)
         g_fhxRuntime = nullptr;
         g_fhxOutputWidth = 0;
         g_fhxOutputHeight = 0;
+        g_fhxUiTargetResources.clear();
+        g_fhxPredictedResourcesThisFrame.clear();
+        g_fhxTargetPredictionCountThisFrame = 0;
+        g_fhxPredictedCommandListThisFrame = nullptr;
+        g_fhxPredictedResourceThisFrame = 0;
+        g_fhxPredictedViewThisFrame = 0;
+        g_fhxTargetTeacherSeenThisFrame = false;
+        g_fhxTargetTeacherWasKnownThisFrame = false;
+        g_fhxTargetTeacherConfirmedThisFrame = false;
+        g_fhxTeacherResourceThisFrame = 0;
+        g_fhxTeacherViewThisFrame = 0;
+        invalidateFHXTargetValidationUnsafe();
     }
 }
 
@@ -1464,32 +1477,29 @@ static void profileCurrentDrawFHX(command_list *commandList)
                     previousIt != g_fhxCurrentPassPreviousSignatureKey.end() ? previousIt->second : 0;
             }
 
-            FHXUiOwnerState &owner = getFHXUiOwnerStateUnsafe(commandList);
-            if (owner.lastTeacherGeneration != owner.generation)
+            if (!g_fhxTargetTeacherSeenThisFrame &&
+                currentFHXPassMatchesLearnedBaseUnsafe(commandList, sigIt->second) &&
+                rt.resourceHandle != 0)
             {
-                const bool wasKnownOwner = owner.uiOwner;
-                owner.lastTeacherGeneration = owner.generation;
+                g_fhxTargetTeacherSeenThisFrame = true;
+                g_fhxTeacherResourceThisFrame = rt.resourceHandle;
+                g_fhxTeacherViewThisFrame = rt.viewHandle;
                 ++g_fhxTeacherObservations;
 
-                if (!wasKnownOwner)
+                g_fhxTargetTeacherWasKnownThisFrame =
+                    g_fhxUiTargetResources.find(rt.resourceHandle) != g_fhxUiTargetResources.end();
+
+                if (!g_fhxTargetTeacherWasKnownThisFrame)
                 {
-                    owner.uiOwner = true;
-                    owner.learnedGeneration = owner.generation;
-                    ++g_fhxOwnerLearnEvents;
-                    invalidateFHXOwnerValidationUnsafe();
+                    g_fhxUiTargetResources.insert(rt.resourceHandle);
+                    ++g_fhxTargetLearnEvents;
+                    invalidateFHXTargetValidationUnsafe();
                 }
-                else if (owner.generation > owner.learnedGeneration)
-                {
-                    if (owner.lastPredictedGeneration == owner.generation)
-                    {
-                        confirmFHXOwnerReuseUnsafe(owner);
-                    }
-                    else if (learnedFHXBaseContextStable())
-                    {
-                        ++g_fhxOwnerMissedPredictions;
-                        invalidateFHXOwnerValidationUnsafe();
-                    }
-                }
+
+                g_fhxTargetTeacherConfirmedThisFrame =
+                    g_fhxTargetPredictionCountThisFrame == 1 &&
+                    g_fhxPredictedCommandListThisFrame == commandList &&
+                    g_fhxPredictedResourceThisFrame == rt.resourceHandle;
             }
         }
     }
@@ -1576,10 +1586,105 @@ static void onReshadePresentFHX(effect_runtime *runtime)
             g_fhxLearnedTeacherLocalOccurrence = g_fhxObservedTeacherLocalOccurrence;
             g_fhxLearnedTeacherPreviousSignatureKey = g_fhxObservedTeacherPreviousSignatureKey;
             g_fhxBaseStableFrames = 1;
-            invalidateFHXOwnerValidationUnsafe();
+            invalidateFHXTargetValidationUnsafe();
         }
 
         g_fhxLastSignatureOccurrences = occurrences;
+    }
+
+    const bool effectsEnabled =
+        runtime != nullptr && runtime->get_effects_state();
+
+    if (learnedFHXBaseContextStable())
+    {
+        if (!effectsEnabled)
+        {
+            // Discovery may continue with effects off, but certification is
+            // deliberately tied to the actual DLSS/Lumenite runtime state.
+            invalidateFHXTargetValidationUnsafe();
+        }
+        else if (g_fhxTargetTeacherSeenThisFrame)
+        {
+            if (!g_fhxTargetTeacherWasKnownThisFrame)
+            {
+                // Learning a newly observed rotating UI target is neither a
+                // pass nor a failure. Any old learned target that predicted in
+                // its place is stale and is revoked below.
+                for (const uint64_t predictedResource : g_fhxPredictedResourcesThisFrame)
+                {
+                    if (predictedResource != g_fhxTeacherResourceThisFrame)
+                    {
+                        if (g_fhxUiTargetResources.erase(predictedResource) != 0)
+                            ++g_fhxTargetRoleChanges;
+                    }
+                }
+
+                if (g_fhxTargetPredictionCountThisFrame != 0)
+                    g_fhxTargetFalsePredictions += g_fhxTargetPredictionCountThisFrame;
+
+                invalidateFHXTargetValidationUnsafe();
+            }
+            else if (g_fhxTargetPredictionCountThisFrame == 1 &&
+                     g_fhxTargetTeacherConfirmedThisFrame)
+            {
+                ++g_fhxTargetConfirmations;
+                if (g_fhxTargetValidationStreak < 0xFFFFFFFFu)
+                    ++g_fhxTargetValidationStreak;
+
+                if (g_fhxTargetValidationStreak >= kFHXTargetValidationFramesRequired)
+                    g_fhxTargetValidationPassed = true;
+            }
+            else
+            {
+                if (g_fhxTargetPredictionCountThisFrame == 0)
+                {
+                    ++g_fhxTargetMissedPredictions;
+                }
+                else
+                {
+                    if (g_fhxTargetPredictionCountThisFrame > 1)
+                    {
+                        const uint32_t duplicates =
+                            g_fhxTargetPredictionCountThisFrame - 1;
+                        g_fhxTargetDuplicatePredictions += duplicates;
+                        g_fhxTargetFalsePredictions += duplicates;
+                    }
+
+                    if (!g_fhxTargetTeacherConfirmedThisFrame)
+                    {
+                        ++g_fhxTargetMissedPredictions;
+                        ++g_fhxTargetFalsePredictions;
+                    }
+                }
+
+                // Any predicted resource other than the teacher resource just
+                // demonstrated a role change. Revoke it immediately.
+                for (const uint64_t predictedResource : g_fhxPredictedResourcesThisFrame)
+                {
+                    if (predictedResource != g_fhxTeacherResourceThisFrame)
+                    {
+                        if (g_fhxUiTargetResources.erase(predictedResource) != 0)
+                            ++g_fhxTargetRoleChanges;
+                    }
+                }
+
+                invalidateFHXTargetValidationUnsafe();
+            }
+        }
+        else if (g_fhxTargetPredictionCountThisFrame != 0)
+        {
+            // A learned target matched the pre-UI structure but no Primary UI
+            // teacher followed in this frame, so that target is no longer safe.
+            g_fhxTargetFalsePredictions += g_fhxTargetPredictionCountThisFrame;
+
+            for (const uint64_t predictedResource : g_fhxPredictedResourcesThisFrame)
+            {
+                if (g_fhxUiTargetResources.erase(predictedResource) != 0)
+                    ++g_fhxTargetRoleChanges;
+            }
+
+            invalidateFHXTargetValidationUnsafe();
+        }
     }
 
     if (g_fhxWarmupIssued && !g_fhxWarmupReady)
@@ -1604,7 +1709,7 @@ static void onReshadePresentFHX(effect_runtime *runtime)
     {
         g_fhxBoundaryInjectStatus = learnedFHXBoundaryReady()
             ? FHXBoundaryInjectStatus::candidate_detected
-            : (learnedFHXBaseContextStable() && countKnownFHXUiOwnersUnsafe() != 0
+            : (learnedFHXBaseContextStable() && countKnownFHXUiTargetsUnsafe() != 0
                 ? FHXBoundaryInjectStatus::waiting_for_ui_prepass
                 : FHXBoundaryInjectStatus::disabled);
     }
@@ -1621,6 +1726,16 @@ static void onReshadePresentFHX(effect_runtime *runtime)
     g_fhxObservedTeacherSignatureKey = 0;
     g_fhxObservedTeacherLocalOccurrence = 0;
     g_fhxObservedTeacherPreviousSignatureKey = 0;
+    g_fhxTargetPredictionCountThisFrame = 0;
+    g_fhxPredictedCommandListThisFrame = nullptr;
+    g_fhxPredictedResourceThisFrame = 0;
+    g_fhxPredictedViewThisFrame = 0;
+    g_fhxPredictedResourcesThisFrame.clear();
+    g_fhxTargetTeacherSeenThisFrame = false;
+    g_fhxTargetTeacherWasKnownThisFrame = false;
+    g_fhxTargetTeacherConfirmedThisFrame = false;
+    g_fhxTeacherResourceThisFrame = 0;
+    g_fhxTeacherViewThisFrame = 0;
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
 }
@@ -1723,15 +1838,17 @@ static void displayFHXHuntOverlay(effect_runtime *)
     uint64_t learnedTeacherPreviousSignatureKey = 0;
     uint32_t baseStableFrames = 0;
     uint32_t lastSignatureOccurrences = 0;
-    uint32_t knownUiOwnerLists = 0;
-    uint32_t ownerValidationStreak = 0;
-    bool ownerValidationPassed = false;
-    uint64_t ownerLearnEvents = 0;
-    uint64_t ownerPredictions = 0;
-    uint64_t ownerConfirmations = 0;
-    uint64_t ownerFalsePredictions = 0;
-    uint64_t ownerMissedPredictions = 0;
-    uint64_t ownerRoleChanges = 0;
+    uint32_t knownUiTargets = 0;
+    uint32_t targetValidationStreak = 0;
+    bool targetValidationPassed = false;
+    uint64_t targetLearnEvents = 0;
+    uint64_t targetDestroyEvents = 0;
+    uint64_t targetPredictions = 0;
+    uint64_t targetConfirmations = 0;
+    uint64_t targetFalsePredictions = 0;
+    uint64_t targetMissedPredictions = 0;
+    uint64_t targetDuplicatePredictions = 0;
+    uint64_t targetRoleChanges = 0;
     uint64_t signatureChanges = 0;
     uint64_t teacherObservations = 0;
     uint64_t safeBoundaryHits = 0;
@@ -1771,15 +1888,17 @@ static void displayFHXHuntOverlay(effect_runtime *)
         learnedTeacherPreviousSignatureKey = g_fhxLearnedTeacherPreviousSignatureKey;
         baseStableFrames = g_fhxBaseStableFrames;
         lastSignatureOccurrences = g_fhxLastSignatureOccurrences;
-        knownUiOwnerLists = countKnownFHXUiOwnersUnsafe();
-        ownerValidationStreak = g_fhxOwnerValidationStreak;
-        ownerValidationPassed = g_fhxOwnerValidationPassed;
-        ownerLearnEvents = g_fhxOwnerLearnEvents;
-        ownerPredictions = g_fhxOwnerPredictions;
-        ownerConfirmations = g_fhxOwnerConfirmations;
-        ownerFalsePredictions = g_fhxOwnerFalsePredictions;
-        ownerMissedPredictions = g_fhxOwnerMissedPredictions;
-        ownerRoleChanges = g_fhxOwnerRoleChanges;
+        knownUiTargets = countKnownFHXUiTargetsUnsafe();
+        targetValidationStreak = g_fhxTargetValidationStreak;
+        targetValidationPassed = g_fhxTargetValidationPassed;
+        targetLearnEvents = g_fhxTargetLearnEvents;
+        targetDestroyEvents = g_fhxTargetDestroyEvents;
+        targetPredictions = g_fhxTargetPredictions;
+        targetConfirmations = g_fhxTargetConfirmations;
+        targetFalsePredictions = g_fhxTargetFalsePredictions;
+        targetMissedPredictions = g_fhxTargetMissedPredictions;
+        targetDuplicatePredictions = g_fhxTargetDuplicatePredictions;
+        targetRoleChanges = g_fhxTargetRoleChanges;
         signatureChanges = g_fhxSignatureChanges;
         teacherObservations = g_fhxTeacherObservations;
         safeBoundaryHits = g_fhxSafeBoundaryHits;
@@ -1880,15 +1999,27 @@ static void displayFHXHuntOverlay(effect_runtime *)
         g_fhxLearnedTeacherPreviousSignatureKey = 0;
         g_fhxBaseStableFrames = 0;
         g_fhxLastSignatureOccurrences = 0;
-        g_fhxUiOwnerStates.clear();
-        g_fhxOwnerValidationStreak = 0;
-        g_fhxOwnerValidationPassed = false;
-        g_fhxOwnerLearnEvents = 0;
-        g_fhxOwnerPredictions = 0;
-        g_fhxOwnerConfirmations = 0;
-        g_fhxOwnerFalsePredictions = 0;
-        g_fhxOwnerMissedPredictions = 0;
-        g_fhxOwnerRoleChanges = 0;
+        g_fhxUiTargetResources.clear();
+        g_fhxTargetPredictionCountThisFrame = 0;
+        g_fhxPredictedCommandListThisFrame = nullptr;
+        g_fhxPredictedResourceThisFrame = 0;
+        g_fhxPredictedViewThisFrame = 0;
+        g_fhxPredictedResourcesThisFrame.clear();
+        g_fhxTargetTeacherSeenThisFrame = false;
+        g_fhxTargetTeacherWasKnownThisFrame = false;
+        g_fhxTargetTeacherConfirmedThisFrame = false;
+        g_fhxTeacherResourceThisFrame = 0;
+        g_fhxTeacherViewThisFrame = 0;
+        g_fhxTargetValidationStreak = 0;
+        g_fhxTargetValidationPassed = false;
+        g_fhxTargetLearnEvents = 0;
+        g_fhxTargetDestroyEvents = 0;
+        g_fhxTargetPredictions = 0;
+        g_fhxTargetConfirmations = 0;
+        g_fhxTargetFalsePredictions = 0;
+        g_fhxTargetMissedPredictions = 0;
+        g_fhxTargetDuplicatePredictions = 0;
+        g_fhxTargetRoleChanges = 0;
         resetFHXBoundaryTest();
     }
 
@@ -1901,19 +2032,21 @@ static void displayFHXHuntOverlay(effect_runtime *)
                 learnedTeacherLocalOccurrence,
                 lastSignatureOccurrences,
                 static_cast<unsigned long long>(learnedTeacherPreviousSignatureKey));
-    ImGui::Text("Stage 2 - session UI owners: %u command lists | learn events %llu",
-                knownUiOwnerLists,
-                static_cast<unsigned long long>(ownerLearnEvents));
-    ImGui::Text("Owner reuse validation: %s | confirmation streak %u/%u",
-                ownerValidationPassed ? "PASSED" : "RUNNING",
-                ownerValidationStreak,
-                kFHXOwnerReuseValidationRequired);
-    ImGui::Text("Reuse events: predictions %llu | confirmations %llu | false %llu | missed %llu | role changes %llu",
-                static_cast<unsigned long long>(ownerPredictions),
-                static_cast<unsigned long long>(ownerConfirmations),
-                static_cast<unsigned long long>(ownerFalsePredictions),
-                static_cast<unsigned long long>(ownerMissedPredictions),
-                static_cast<unsigned long long>(ownerRoleChanges));
+    ImGui::Text("Stage 2 - session UI targets: %u resources | learn %llu | destroyed %llu",
+                knownUiTargets,
+                static_cast<unsigned long long>(targetLearnEvents),
+                static_cast<unsigned long long>(targetDestroyEvents));
+    ImGui::Text("Target validation: %s | confirmation streak %u/%u",
+                targetValidationPassed ? "PASSED" : "RUNNING",
+                targetValidationStreak,
+                kFHXTargetValidationFramesRequired);
+    ImGui::Text("Target events: predictions %llu | confirmations %llu | false %llu | missed %llu | duplicates %llu | role changes %llu",
+                static_cast<unsigned long long>(targetPredictions),
+                static_cast<unsigned long long>(targetConfirmations),
+                static_cast<unsigned long long>(targetFalsePredictions),
+                static_cast<unsigned long long>(targetMissedPredictions),
+                static_cast<unsigned long long>(targetDuplicatePredictions),
+                static_cast<unsigned long long>(targetRoleChanges));
     ImGui::Text("Teacher observations: %llu | base changes: %llu | safe boundary hits: %llu",
                 static_cast<unsigned long long>(teacherObservations),
                 static_cast<unsigned long long>(signatureChanges),
@@ -1958,8 +2091,8 @@ static void displayFHXHuntOverlay(effect_runtime *)
         learnedSignature.valid &&
         learnedTeacherLocalOccurrence != 0 &&
         baseStableFrames >= kFHXSignatureStableFramesRequired &&
-        knownUiOwnerLists != 0 &&
-        ownerValidationPassed;
+        knownUiTargets != 0 &&
+        targetValidationPassed;
 
     if (!boundaryReady)
         ImGui::BeginDisabled();
@@ -2015,13 +2148,13 @@ static void displayFHXHuntOverlay(effect_runtime *)
         ImGui::EndDisabled();
 
     ImGui::TextWrapped(
-        "Stage 1 learns the stable Primary-UI render-pass structure. Stage 2 no longer orders otherwise "
-        "identical Vulkan command lists globally. Instead, the Primary UI draw marks the command-list object "
-        "that actually owns UI work for this process session. On later reset generations of that same object, "
-        "the stable Stage-1 pass is predicted at begin_render_pass and the later Primary UI draw must confirm "
-        "the role. Any predicted generation without Primary UI revokes that owner immediately and resets "
-        "validation. Injection remains locked until 60 consecutive owner-reuse confirmations. Command-list "
-        "pointers are never persisted across launches or object destruction.");
+        "Stage 1 learns the stable Primary-UI render-pass structure. Stage 2 learns the rotating session-local "
+        "render-target resources that actually receive that pass. A prediction requires both the Stage-1 "
+        "structure and a learned resource. The later Primary UI draw must confirm the same resource and the "
+        "same transient command-list instance in that frame. Multiple predictions, a missed teacher, or a "
+        "learned resource appearing without Primary UI resets certification and revokes stale resources. "
+        "Certification advances only while ReShade effects are enabled and requires 60 consecutive confirmed "
+        "frames. Resource identities are removed on destroy_resource and never persisted across launches.");
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
@@ -2120,6 +2253,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
             reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
             reshade::register_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
+            reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResourceFHX);
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandList);
             reshade::register_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::register_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
@@ -2153,6 +2287,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::unregister_event<reshade::addon_event::bind_pipeline>(onBindPipelineFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandListFHX);
             reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+            reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResourceFHX);
             reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandListFHX);
             reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
             reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
