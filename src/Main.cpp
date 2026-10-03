@@ -798,7 +798,92 @@ static uint64_t g_fhxSkippedAmbiguous = 0;
 static uint64_t g_fhxSkippedUnstable = 0;
 
 static FHXBoundaryInjectStatus g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
+
 static thread_local bool g_fhxInsideEffectRender = false;
+
+// -----------------------------------------------------------------------------
+// FHX STATIC BASELINE MAPPER
+//
+// This path intentionally performs ZERO ReShade effect rendering.  It observes
+// only FHX's native shader/render-pass stream so DLSS, NR, Lumenite/Lumite FX,
+// or any other real-time image modification cannot become part of the boundary
+// identity.
+//
+// We keep shader hashes as fixed semantic markers and use render-pass signatures
+// only as recorded data.  No command-list pointer, global/local pass number, or
+// learned/adaptive identity is used to decide where to render effects.
+// -----------------------------------------------------------------------------
+static constexpr uint32_t kFHXStaticWorldHash = 0x64787F0Fu;
+static constexpr uint32_t kFHXStaticBarsHash = 0x30B96240u;
+static constexpr uint32_t kFHXStaticPrimaryUIHash = 0xCF49F7D6u;
+static constexpr uint32_t kFHXStaticMinimapAHash = 0xAFB6F656u;
+static constexpr uint32_t kFHXStaticMinimapBHash = 0xBBB19C94u;
+static constexpr size_t kFHXStaticMaxCandidatePasses = 16;
+
+struct FHXStaticCandidatePass
+{
+    command_list *commandList = nullptr; // diagnostic only; never a persistent identity
+    uint32_t passIndex = 0;              // diagnostic only; reset every present
+    uint64_t signatureKey = 0;
+    FHXPassSignature signature = {};
+    FHXRenderTargetInfo target = {};
+};
+
+struct FHXStaticAnchorObservation
+{
+    bool seen = false;
+    uint64_t firstDraw = 0;
+    uint64_t lastDraw = 0;
+    uint32_t firstPass = 0;
+    uint32_t lastPass = 0;
+    uint32_t count = 0;
+
+    // Meaningful only when the first draw occurred after the current final-world
+    // marker.  Zero means same pass, before world, or no candidate match.
+    uint32_t candidateOrdinal = 0;
+    bool sameWorldPass = false;
+};
+
+struct FHXStaticFrameSummary
+{
+    uint32_t worldCount = 0;
+    uint64_t worldFirstDraw = 0;
+    uint64_t worldLastDraw = 0;
+    uint32_t worldLastPass = 0;
+    uint32_t candidateCount = 0;
+
+    FHXStaticAnchorObservation bars = {};
+    FHXStaticAnchorObservation primaryUI = {};
+    FHXStaticAnchorObservation minimapA = {};
+    FHXStaticAnchorObservation minimapB = {};
+
+    uint32_t confirmedCandidateOrdinal = 0;
+    uint64_t confirmedCandidateSignature = 0;
+    FHXRenderTargetInfo confirmedCandidateTarget = {};
+};
+
+static uint32_t g_fhxStaticWorldCountThisFrame = 0;
+static uint64_t g_fhxStaticWorldFirstDrawThisFrame = 0;
+static uint64_t g_fhxStaticWorldLastDrawThisFrame = 0;
+static uint32_t g_fhxStaticWorldLastPassThisFrame = 0;
+static command_list *g_fhxStaticWorldCommandList = nullptr;
+static bool g_fhxStaticWorldPassEnded = false;
+
+static FHXStaticAnchorObservation g_fhxStaticBarsThisFrame = {};
+static FHXStaticAnchorObservation g_fhxStaticPrimaryUIThisFrame = {};
+static FHXStaticAnchorObservation g_fhxStaticMinimapAThisFrame = {};
+static FHXStaticAnchorObservation g_fhxStaticMinimapBThisFrame = {};
+static std::vector<FHXStaticCandidatePass> g_fhxStaticCandidatePasses;
+
+static FHXStaticFrameSummary g_fhxStaticLastFrame = {};
+static uint64_t g_fhxStaticFramesObserved = 0;
+static uint64_t g_fhxStaticFramesWithWorld = 0;
+static uint64_t g_fhxStaticFramesWithWorldAndPrimaryUI = 0;
+static uint64_t g_fhxStaticFramesWithUIBeforeFinalWorld = 0;
+static uint32_t g_fhxStaticLastPatternOrdinal = 0;
+static uint64_t g_fhxStaticLastPatternSignature = 0;
+static uint32_t g_fhxStaticStablePatternFrames = 0;
+
 
 static const char *fhxBoundaryStatusText(FHXBoundaryInjectStatus status)
 {
@@ -1126,177 +1211,32 @@ static void onBeginRenderPassFHX(command_list *commandList,
     const FHXPassSignature signature = buildFHXPassSignature(commandList, count, rts, ds);
     const uint64_t signatureKey = hashFHXPassSignature(signature);
 
-    effect_runtime *runtime = nullptr;
-    bool performWarmup = false;
-    bool performInjection = false;
+    std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
 
+    const uint32_t passIndex = ++g_fhxNextRenderPass;
+    g_fhxActiveRenderPass[commandList] = passIndex;
+    g_fhxCurrentRenderTarget[commandList] = rt;
+    g_fhxCurrentColorView[commandList] = targetView;
+    g_fhxCurrentPassSignature[commandList] = signature;
+
+    if (signatureKey != 0)
+        ++g_fhxCurrentSignatureCounts[signatureKey];
+
+    // Static baseline rule:
+    // after the MOST RECENT 0x64787F0F pass has actually ended, record every
+    // safe begin_render_pass boundary.  Do not inject anything here.
+    if (g_fhxStaticWorldCountThisFrame != 0 &&
+        g_fhxStaticWorldPassEnded &&
+        g_fhxStaticCandidatePasses.size() < kFHXStaticMaxCandidatePasses)
     {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-
-        const uint32_t passIndex = ++g_fhxNextRenderPass;
-        g_fhxActiveRenderPass[commandList] = passIndex;
-        g_fhxCurrentRenderTarget[commandList] = rt;
-        g_fhxCurrentColorView[commandList] = targetView;
-        g_fhxCurrentPassSignature[commandList] = signature;
-
-        uint32_t localOccurrence = 0;
-        uint64_t previousSignatureKey = 0;
-        if (signatureKey != 0)
-        {
-            ++g_fhxCurrentSignatureCounts[signatureKey];
-            localOccurrence = ++g_fhxLocalSignatureCounts[commandList][signatureKey];
-
-            const auto previousIt = g_fhxLastPassSignatureKey.find(commandList);
-            if (previousIt != g_fhxLastPassSignatureKey.end())
-                previousSignatureKey = previousIt->second;
-
-            g_fhxCurrentPassLocalOccurrence[commandList] = localOccurrence;
-            g_fhxCurrentPassPreviousSignatureKey[commandList] = previousSignatureKey;
-            g_fhxLastPassSignatureKey[commandList] = signatureKey;
-        }
-
-        const bool baseContextMatches =
-            learnedFHXBaseContextStable() &&
-            sameFHXPassSignature(signature, g_fhxLearnedSignature) &&
-            localOccurrence == g_fhxLearnedTeacherLocalOccurrence &&
-            previousSignatureKey == g_fhxLearnedTeacherPreviousSignatureKey;
-
-        uint32_t contextCandidateOrdinal = 0;
-        if (baseContextMatches)
-        {
-            contextCandidateOrdinal = ++g_fhxContextCandidateCounterThisFrame;
-            g_fhxCurrentPassContextCandidateOrdinal[commandList] = contextCandidateOrdinal;
-        }
-        else
-        {
-            g_fhxCurrentPassContextCandidateOrdinal[commandList] = 0;
-        }
-
-        const bool contextMatches =
-            learnedFHXBoundaryContextStable() &&
-            baseContextMatches &&
-            contextCandidateOrdinal == g_fhxLearnedTeacherContextCandidateOrdinal;
-
-        // Dry-run validation performs zero ReShade work. Count predicted hits
-        // here; the Primary-UI teacher confirms the prediction later in-frame.
-        if (g_fhxValidationActive && contextMatches)
-            ++g_fhxValidationPredictionHitsThisFrame;
-
-        const bool testRequested =
-            g_fhxRemainingInjectionFrames != 0 || g_fhxContinuousInjection || g_fhxWarmupPending;
-
-        if (!testRequested)
-            return;
-
-        if (!learnedFHXBoundaryReady())
-        {
-            ++g_fhxSkippedUnstable;
-            return;
-        }
-
-        if (!contextMatches)
-            return;
-
-        ++g_fhxSafeBoundaryHits;
-
-        // The add-on callback runs before ReShade forwards vkCmdBeginRenderPass,
-        // so this is the safe side of the Vulkan render-pass boundary.
-        if (g_fhxLastInjectionPresentSerial == g_fhxPresentSerial)
-            return;
-
-        if (!isFullResolutionMainTargetFHX(rt) || targetView.handle == 0)
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::bad_target;
-            return;
-        }
-
-        runtime = g_fhxRuntime;
-        if (runtime == nullptr)
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
-            return;
-        }
-
-        g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
-
-        if (g_fhxWarmupPending && !g_fhxWarmupIssued)
-        {
-            g_fhxWarmupPending = false;
-            g_fhxWarmupIssued = true;
-            g_fhxWarmupReady = false;
-            g_fhxWarmupQuietPresents = 0;
-            performWarmup = true;
-        }
-        else if (g_fhxWarmupReady)
-        {
-            performInjection = true;
-        }
+        FHXStaticCandidatePass candidate;
+        candidate.commandList = commandList;
+        candidate.passIndex = passIndex;
+        candidate.signatureKey = signatureKey;
+        candidate.signature = signature;
+        candidate.target = rt;
+        g_fhxStaticCandidatePasses.push_back(candidate);
     }
-
-    if (runtime == nullptr)
-        return;
-
-    if (!runtime->get_effects_state())
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::effects_disabled;
-        return;
-    }
-
-    if (performWarmup)
-    {
-        reshade::log::message(
-            reshade::log::level::info,
-            "[REST FHX] safe-boundary warm-up begin");
-
-        g_fhxInsideEffectRender = true;
-        runtime->render_effects(commandList, targetView, targetView);
-        g_fhxInsideEffectRender = false;
-
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        ++g_fhxWarmupCount;
-        g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
-        reshade::log::message(
-            reshade::log::level::info,
-            "[REST FHX] safe-boundary warm-up end");
-        return;
-    }
-
-    if (!performInjection)
-        return;
-
-    reshade::log::message(
-        reshade::log::level::info,
-        "[REST FHX] safe-boundary render_effects begin");
-
-    g_fhxInsideEffectRender = true;
-    runtime->render_effects(commandList, targetView, targetView);
-    g_fhxInsideEffectRender = false;
-
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        ++g_fhxInjectionCount;
-
-        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames != 0)
-            --g_fhxRemainingInjectionFrames;
-
-        if (!g_fhxContinuousInjection && g_fhxRemainingInjectionFrames == 0)
-        {
-            g_fhxRequestedInjectionFrames = 0;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-            reshade::log::message(
-                reshade::log::level::info,
-                "[REST FHX] finite structural-boundary test complete");
-        }
-        else
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::injected;
-        }
-    }
-
-    reshade::log::message(
-        reshade::log::level::info,
-        "[REST FHX] safe-boundary render_effects end");
 }
 
 static void onEndRenderPassFHX(command_list *commandList)
@@ -1305,6 +1245,18 @@ static void onEndRenderPassFHX(command_list *commandList)
         return;
 
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
+
+    const auto passIt = g_fhxActiveRenderPass.find(commandList);
+    const uint32_t endingPass =
+        passIt != g_fhxActiveRenderPass.end() ? passIt->second : 0;
+
+    if (g_fhxStaticWorldCountThisFrame != 0 &&
+        commandList == g_fhxStaticWorldCommandList &&
+        endingPass == g_fhxStaticWorldLastPassThisFrame)
+    {
+        g_fhxStaticWorldPassEnded = true;
+    }
+
     g_fhxActiveRenderPass[commandList] = 0;
     g_fhxCurrentRenderTarget[commandList] = FHXRenderTargetInfo {};
     g_fhxCurrentColorView[commandList] = resource_view {};
@@ -1423,38 +1375,72 @@ static void profileCurrentDrawFHX(command_list *commandList)
         rt = rtIt->second;
     const uint32_t rtId = getRenderTargetIdFHX(rt);
 
-    if (pixelHash == fhxBoundaryTeacherHash(g_fhxSelectedBoundaryTeacher) &&
-        isFullResolutionMainTargetFHX(rt))
-    {
-        const auto sigIt = g_fhxCurrentPassSignature.find(commandList);
-        if (sigIt != g_fhxCurrentPassSignature.end() && sigIt->second.valid)
+    auto candidateOrdinalForCurrentPass = [&]() -> uint32_t {
+        for (size_t i = 0; i < g_fhxStaticCandidatePasses.size(); ++i)
         {
-            if (!g_fhxObservedTeacherSignature.valid)
+            const FHXStaticCandidatePass &candidate = g_fhxStaticCandidatePasses[i];
+            if (candidate.commandList == commandList && candidate.passIndex == passIndex)
+                return static_cast<uint32_t>(i + 1);
+        }
+        return 0;
+    };
+
+    auto observeAnchor = [&](FHXStaticAnchorObservation &obs) {
+        if (!obs.seen)
+        {
+            obs.seen = true;
+            obs.firstDraw = drawIndex;
+            obs.firstPass = passIndex;
+
+            if (g_fhxStaticWorldCountThisFrame != 0)
             {
-                g_fhxObservedTeacherSignature = sigIt->second;
-                g_fhxObservedTeacherSignatureKey = hashFHXPassSignature(sigIt->second);
-
-                const auto occurrenceIt = g_fhxCurrentPassLocalOccurrence.find(commandList);
-                g_fhxObservedTeacherLocalOccurrence =
-                    occurrenceIt != g_fhxCurrentPassLocalOccurrence.end() ? occurrenceIt->second : 0;
-
-                const auto previousIt = g_fhxCurrentPassPreviousSignatureKey.find(commandList);
-                g_fhxObservedTeacherPreviousSignatureKey =
-                    previousIt != g_fhxCurrentPassPreviousSignatureKey.end() ? previousIt->second : 0;
-
-                const auto candidateIt = g_fhxCurrentPassContextCandidateOrdinal.find(commandList);
-                g_fhxObservedTeacherContextCandidateOrdinal =
-                    candidateIt != g_fhxCurrentPassContextCandidateOrdinal.end() ? candidateIt->second : 0;
-
-                if (g_fhxValidationActive)
+                if (commandList == g_fhxStaticWorldCommandList &&
+                    passIndex == g_fhxStaticWorldLastPassThisFrame)
                 {
-                    g_fhxValidationTeacherSeenThisFrame = true;
-                    g_fhxValidationTeacherCandidateThisFrame = g_fhxObservedTeacherContextCandidateOrdinal;
+                    obs.sameWorldPass = true;
                 }
-
-                ++g_fhxTeacherObservations;
+                else if (drawIndex > g_fhxStaticWorldLastDrawThisFrame)
+                {
+                    obs.candidateOrdinal = candidateOrdinalForCurrentPass();
+                }
             }
         }
+
+        obs.lastDraw = drawIndex;
+        obs.lastPass = passIndex;
+        ++obs.count;
+    };
+
+    if (pixelHash == kFHXStaticWorldHash)
+    {
+        ++g_fhxStaticWorldCountThisFrame;
+        if (g_fhxStaticWorldFirstDrawThisFrame == 0)
+            g_fhxStaticWorldFirstDrawThisFrame = drawIndex;
+
+        // Always track the LAST world marker in the frame.  Any safe pass
+        // candidates gathered after an earlier occurrence are no longer the
+        // boundary following the final native world marker.
+        g_fhxStaticWorldLastDrawThisFrame = drawIndex;
+        g_fhxStaticWorldLastPassThisFrame = passIndex;
+        g_fhxStaticWorldCommandList = commandList;
+        g_fhxStaticWorldPassEnded = false;
+        g_fhxStaticCandidatePasses.clear();
+    }
+    else if (pixelHash == kFHXStaticBarsHash)
+    {
+        observeAnchor(g_fhxStaticBarsThisFrame);
+    }
+    else if (pixelHash == kFHXStaticPrimaryUIHash)
+    {
+        observeAnchor(g_fhxStaticPrimaryUIThisFrame);
+    }
+    else if (pixelHash == kFHXStaticMinimapAHash)
+    {
+        observeAnchor(g_fhxStaticMinimapAThisFrame);
+    }
+    else if (pixelHash == kFHXStaticMinimapBHash)
+    {
+        observeAnchor(g_fhxStaticMinimapBThisFrame);
     }
 
     FHXShaderFrameStat &stat = g_fhxCurrentPixelFrame[pixelHash];
@@ -1495,6 +1481,7 @@ static void onReshadePresentFHX(effect_runtime *runtime)
     std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
 
     ++g_fhxPresentSerial;
+    ++g_fhxStaticFramesObserved;
 
     if (runtime != nullptr)
     {
@@ -1511,170 +1498,140 @@ static void onReshadePresentFHX(effect_runtime *runtime)
         ++g_fhxProfiledFrame;
     }
 
-    if (g_fhxObservedTeacherSignature.valid &&
-        g_fhxObservedTeacherSignatureKey != 0 &&
-        g_fhxObservedTeacherLocalOccurrence != 0)
+    FHXStaticFrameSummary summary;
+    summary.worldCount = g_fhxStaticWorldCountThisFrame;
+    summary.worldFirstDraw = g_fhxStaticWorldFirstDrawThisFrame;
+    summary.worldLastDraw = g_fhxStaticWorldLastDrawThisFrame;
+    summary.worldLastPass = g_fhxStaticWorldLastPassThisFrame;
+    summary.candidateCount = static_cast<uint32_t>(g_fhxStaticCandidatePasses.size());
+    summary.bars = g_fhxStaticBarsThisFrame;
+    summary.primaryUI = g_fhxStaticPrimaryUIThisFrame;
+    summary.minimapA = g_fhxStaticMinimapAThisFrame;
+    summary.minimapB = g_fhxStaticMinimapBThisFrame;
+
+    if (summary.worldCount != 0)
+        ++g_fhxStaticFramesWithWorld;
+
+    if (summary.worldCount != 0 && summary.primaryUI.seen)
+        ++g_fhxStaticFramesWithWorldAndPrimaryUI;
+
+    const auto uiBeforeFinalWorld = [&](const FHXStaticAnchorObservation &obs) {
+        return obs.seen && summary.worldLastDraw != 0 && obs.firstDraw < summary.worldLastDraw;
+    };
+
+    if (uiBeforeFinalWorld(summary.bars) ||
+        uiBeforeFinalWorld(summary.primaryUI) ||
+        uiBeforeFinalWorld(summary.minimapA) ||
+        uiBeforeFinalWorld(summary.minimapB))
     {
-        const auto countIt = g_fhxCurrentSignatureCounts.find(g_fhxObservedTeacherSignatureKey);
-        const uint32_t occurrences =
-            countIt != g_fhxCurrentSignatureCounts.end() ? countIt->second : 0;
+        ++g_fhxStaticFramesWithUIBeforeFinalWorld;
+    }
 
-        const bool sameBase =
-            sameFHXPassSignature(g_fhxObservedTeacherSignature, g_fhxLearnedSignature) &&
-            g_fhxObservedTeacherLocalOccurrence == g_fhxLearnedTeacherLocalOccurrence &&
-            g_fhxObservedTeacherPreviousSignatureKey == g_fhxLearnedTeacherPreviousSignatureKey;
+    // For pattern stability, prefer the EARLIEST known UI anchor that occurs
+    // after the final 0x64787F0F marker.  This prevents us from accidentally
+    // validating a boundary that leaves an earlier HUD layer inside the effect.
+    const FHXStaticAnchorObservation *earliestAfterWorld = nullptr;
+    auto considerAnchor = [&](const FHXStaticAnchorObservation &obs) {
+        if (!obs.seen || summary.worldLastDraw == 0 || obs.firstDraw <= summary.worldLastDraw)
+            return;
+        if (earliestAfterWorld == nullptr || obs.firstDraw < earliestAfterWorld->firstDraw)
+            earliestAfterWorld = &obs;
+    };
 
-        if (sameBase)
+    considerAnchor(summary.bars);
+    considerAnchor(summary.primaryUI);
+    considerAnchor(summary.minimapA);
+    considerAnchor(summary.minimapB);
+
+    if (earliestAfterWorld != nullptr && earliestAfterWorld->candidateOrdinal != 0)
+    {
+        summary.confirmedCandidateOrdinal = earliestAfterWorld->candidateOrdinal;
+        const size_t index = static_cast<size_t>(summary.confirmedCandidateOrdinal - 1);
+        if (index < g_fhxStaticCandidatePasses.size())
         {
-            if (g_fhxBaseStableFrames < 0xFFFFFFFFu)
-                ++g_fhxBaseStableFrames;
+            const FHXStaticCandidatePass &candidate = g_fhxStaticCandidatePasses[index];
+            summary.confirmedCandidateSignature = candidate.signatureKey;
+            summary.confirmedCandidateTarget = candidate.target;
+        }
+    }
+
+    const bool stableSample =
+        summary.confirmedCandidateOrdinal != 0 &&
+        summary.confirmedCandidateSignature != 0;
+
+    bool patternChanged = false;
+    if (stableSample)
+    {
+        if (summary.confirmedCandidateOrdinal == g_fhxStaticLastPatternOrdinal &&
+            summary.confirmedCandidateSignature == g_fhxStaticLastPatternSignature)
+        {
+            if (g_fhxStaticStablePatternFrames < 0xFFFFFFFFu)
+                ++g_fhxStaticStablePatternFrames;
         }
         else
         {
-            if (g_fhxLearnedSignature.valid)
-                ++g_fhxSignatureChanges;
+            patternChanged =
+                g_fhxStaticLastPatternOrdinal != 0 ||
+                g_fhxStaticLastPatternSignature != 0;
 
-            g_fhxLearnedSignature = g_fhxObservedTeacherSignature;
-            g_fhxLearnedSignatureKey = g_fhxObservedTeacherSignatureKey;
-            g_fhxLearnedTeacherLocalOccurrence = g_fhxObservedTeacherLocalOccurrence;
-            g_fhxLearnedTeacherPreviousSignatureKey = g_fhxObservedTeacherPreviousSignatureKey;
-            g_fhxBaseStableFrames = 1;
-
-            // A changed base invalidates Stage 2 and any prior dry-run result.
-            g_fhxLearnedTeacherContextCandidateOrdinal = 0;
-            g_fhxCandidateStableFrames = 0;
-            resetFHXValidation(true);
-        }
-
-        g_fhxLastSignatureOccurrences = occurrences;
-
-        // Stage 2 is deliberately deferred until the base relationship has
-        // already survived 20 frames. At that point begin_render_pass can
-        // enumerate ONLY the reduced base-context candidates, and the later
-        // Primary-UI draw tells us which candidate actually owns the UI.
-        if (learnedFHXBaseContextStable() &&
-            g_fhxObservedTeacherContextCandidateOrdinal != 0)
-        {
-            if (g_fhxLearnedTeacherContextCandidateOrdinal ==
-                g_fhxObservedTeacherContextCandidateOrdinal)
-            {
-                if (g_fhxCandidateStableFrames < 0xFFFFFFFFu)
-                    ++g_fhxCandidateStableFrames;
-            }
-            else
-            {
-                if (g_fhxLearnedTeacherContextCandidateOrdinal != 0)
-                    ++g_fhxCandidateChanges;
-
-                g_fhxLearnedTeacherContextCandidateOrdinal =
-                    g_fhxObservedTeacherContextCandidateOrdinal;
-                g_fhxCandidateStableFrames = 1;
-                resetFHXValidation(true);
-            }
+            g_fhxStaticLastPatternOrdinal = summary.confirmedCandidateOrdinal;
+            g_fhxStaticLastPatternSignature = summary.confirmedCandidateSignature;
+            g_fhxStaticStablePatternFrames = 1;
         }
     }
-
-    g_fhxLastContextCandidateCount = g_fhxContextCandidateCounterThisFrame;
-
-    // Validation is evaluated per completed frame. A pass requires one and only
-    // one prediction, the teacher to be present, and the teacher to identify
-    // exactly the same learned candidate for all 60 frames.
-    if (g_fhxValidationActive)
+    else
     {
-        if (g_fhxValidationPredictionHitsThisFrame == 1)
-            ++g_fhxValidationUniqueHitFrames;
-        else if (g_fhxValidationPredictionHitsThisFrame == 0)
-            ++g_fhxValidationMissedFrames;
-        else
-            g_fhxValidationDuplicateHits += g_fhxValidationPredictionHitsThisFrame - 1;
-
-        if (!g_fhxValidationTeacherSeenThisFrame)
-        {
-            ++g_fhxValidationTeacherMissingFrames;
-        }
-        else if (g_fhxValidationTeacherCandidateThisFrame ==
-                 g_fhxLearnedTeacherContextCandidateOrdinal)
-        {
-            ++g_fhxValidationTeacherConfirmedFrames;
-        }
-        else
-        {
-            ++g_fhxValidationTeacherMismatchFrames;
-        }
-
-        ++g_fhxValidationFramesCompleted;
-
-        g_fhxValidationPredictionHitsThisFrame = 0;
-        g_fhxValidationTeacherSeenThisFrame = false;
-        g_fhxValidationTeacherCandidateThisFrame = 0;
-
-        if (g_fhxValidationFramesCompleted >= kFHXValidationPresentsRequired)
-        {
-            g_fhxValidationActive = false;
-            g_fhxBoundaryValidated =
-                g_fhxValidationUniqueHitFrames == kFHXValidationPresentsRequired &&
-                g_fhxValidationMissedFrames == 0 &&
-                g_fhxValidationDuplicateHits == 0 &&
-                g_fhxValidationTeacherConfirmedFrames == kFHXValidationPresentsRequired &&
-                g_fhxValidationTeacherMismatchFrames == 0 &&
-                g_fhxValidationTeacherMissingFrames == 0;
-
-            if (g_fhxBoundaryValidated)
-            {
-                g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-                reshade::log::message(
-                    reshade::log::level::info,
-                    "[REST FHX] teacher-correlated contextual boundary passed 60-frame dry-run validation");
-            }
-            else
-            {
-                g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::disabled;
-                const std::string msg = std::format(
-                    "[REST FHX] dry-run failed: predictedUnique={}, missed={}, duplicates={}, teacherConfirmed={}, teacherMismatch={}, teacherMissing={}",
-                    g_fhxValidationUniqueHitFrames,
-                    g_fhxValidationMissedFrames,
-                    g_fhxValidationDuplicateHits,
-                    g_fhxValidationTeacherConfirmedFrames,
-                    g_fhxValidationTeacherMismatchFrames,
-                    g_fhxValidationTeacherMissingFrames);
-                reshade::log::message(reshade::log::level::warning, msg.c_str());
-            }
-        }
+        if (g_fhxStaticLastPatternOrdinal != 0 || g_fhxStaticLastPatternSignature != 0)
+            patternChanged = true;
+        g_fhxStaticLastPatternOrdinal = 0;
+        g_fhxStaticLastPatternSignature = 0;
+        g_fhxStaticStablePatternFrames = 0;
     }
-    else if (learnedFHXBoundaryContextStable() &&
-             !g_fhxBoundaryValidated &&
-             !g_fhxValidationAttempted)
+
+    g_fhxStaticLastFrame = summary;
+
+    const bool stabilityMilestone =
+        g_fhxStaticStablePatternFrames == 1 ||
+        g_fhxStaticStablePatternFrames == 20 ||
+        g_fhxStaticStablePatternFrames == 60 ||
+        g_fhxStaticStablePatternFrames == 120 ||
+        g_fhxStaticStablePatternFrames == 300;
+
+    if (patternChanged || stabilityMilestone)
     {
-        startFHXValidation();
+        const std::string msg = std::format(
+            "[REST FHX STATIC] frame={} world=count:{} first:{} last:{} pass:{} | "
+            "bars={}/p{}/c{} primary={}/p{}/c{} miniA={}/p{}/c{} miniB={}/p{}/c{} | "
+            "safeCandidate={}/{} sig=0x{:016X} rt={}x{} fmt={} | stable={}",
+            g_fhxPresentSerial,
+            summary.worldCount,
+            summary.worldFirstDraw,
+            summary.worldLastDraw,
+            summary.worldLastPass,
+            summary.bars.firstDraw,
+            summary.bars.firstPass,
+            summary.bars.candidateOrdinal,
+            summary.primaryUI.firstDraw,
+            summary.primaryUI.firstPass,
+            summary.primaryUI.candidateOrdinal,
+            summary.minimapA.firstDraw,
+            summary.minimapA.firstPass,
+            summary.minimapA.candidateOrdinal,
+            summary.minimapB.firstDraw,
+            summary.minimapB.firstPass,
+            summary.minimapB.candidateOrdinal,
+            summary.confirmedCandidateOrdinal,
+            summary.candidateCount,
+            summary.confirmedCandidateSignature,
+            summary.confirmedCandidateTarget.width,
+            summary.confirmedCandidateTarget.height,
+            summary.confirmedCandidateTarget.formatValue,
+            g_fhxStaticStablePatternFrames);
+        reshade::log::message(reshade::log::level::info, msg.c_str());
     }
 
-    if (g_fhxWarmupIssued && !g_fhxWarmupReady)
-    {
-        if (g_fhxWarmupQuietPresents < kFHXWarmupSettledPresents)
-            ++g_fhxWarmupQuietPresents;
-
-        if (g_fhxWarmupQuietPresents >= kFHXWarmupSettledPresents)
-        {
-            g_fhxWarmupReady = true;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-            reshade::log::message(
-                reshade::log::level::info,
-                "[REST FHX] safe-boundary warm-up settled; requested test is live");
-        }
-        else
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::waiting_for_candidate;
-        }
-    }
-    else if (g_fhxRemainingInjectionFrames == 0 &&
-             !g_fhxContinuousInjection &&
-             !g_fhxValidationActive)
-    {
-        g_fhxBoundaryInjectStatus = learnedFHXBoundaryReady()
-            ? FHXBoundaryInjectStatus::candidate_detected
-            : FHXBoundaryInjectStatus::disabled;
-    }
-
+    // Reset only per-frame observations. Persistent totals and the last summary
+    // remain available in the overlay.  No ReShade effect work is issued.
     g_fhxCurrentPixelFrame.clear();
     g_fhxCurrentShaderRTFrame.clear();
     g_fhxCurrentRTCatalog.clear();
@@ -1690,6 +1647,19 @@ static void onReshadePresentFHX(effect_runtime *runtime)
     g_fhxObservedTeacherLocalOccurrence = 0;
     g_fhxObservedTeacherPreviousSignatureKey = 0;
     g_fhxObservedTeacherContextCandidateOrdinal = 0;
+
+    g_fhxStaticWorldCountThisFrame = 0;
+    g_fhxStaticWorldFirstDrawThisFrame = 0;
+    g_fhxStaticWorldLastDrawThisFrame = 0;
+    g_fhxStaticWorldLastPassThisFrame = 0;
+    g_fhxStaticWorldCommandList = nullptr;
+    g_fhxStaticWorldPassEnded = false;
+    g_fhxStaticBarsThisFrame = FHXStaticAnchorObservation {};
+    g_fhxStaticPrimaryUIThisFrame = FHXStaticAnchorObservation {};
+    g_fhxStaticMinimapAThisFrame = FHXStaticAnchorObservation {};
+    g_fhxStaticMinimapBThisFrame = FHXStaticAnchorObservation {};
+    g_fhxStaticCandidatePasses.clear();
+
     g_fhxCurrentDrawIndex = 0;
     g_fhxNextRenderPass = 0;
 }
@@ -1813,6 +1783,13 @@ static void displayFHXHuntOverlay(effect_runtime *)
     FHXPassSignature learnedSignature = {};
     FHXBoundaryInjectStatus harnessStatus = FHXBoundaryInjectStatus::disabled;
 
+    FHXStaticFrameSummary staticFrame = {};
+    uint64_t staticFramesObserved = 0;
+    uint64_t staticFramesWithWorld = 0;
+    uint64_t staticFramesWithWorldAndPrimaryUI = 0;
+    uint64_t staticFramesWithUIBeforeFinalWorld = 0;
+    uint32_t staticStablePatternFrames = 0;
+
     {
         std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
         pixelHashes.assign(g_fhxSeenPixelShaders.begin(), g_fhxSeenPixelShaders.end());
@@ -1864,6 +1841,13 @@ static void displayFHXHuntOverlay(effect_runtime *)
         skippedUnstable = g_fhxSkippedUnstable;
         learnedSignature = g_fhxLearnedSignature;
         harnessStatus = g_fhxBoundaryInjectStatus;
+
+        staticFrame = g_fhxStaticLastFrame;
+        staticFramesObserved = g_fhxStaticFramesObserved;
+        staticFramesWithWorld = g_fhxStaticFramesWithWorld;
+        staticFramesWithWorldAndPrimaryUI = g_fhxStaticFramesWithWorldAndPrimaryUI;
+        staticFramesWithUIBeforeFinalWorld = g_fhxStaticFramesWithUIBeforeFinalWorld;
+        staticStablePatternFrames = g_fhxStaticStablePatternFrames;
     }
 
     std::sort(pixelHashes.begin(), pixelHashes.end());
@@ -1933,191 +1917,63 @@ static void displayFHXHuntOverlay(effect_runtime *)
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::TextUnformatted("FHX structural pre-UI boundary harness");
+    ImGui::TextUnformatted("FHX static native-frame baseline");
     ImGui::Text("Output size: %ux%u", g_fhxOutputWidth, g_fhxOutputHeight);
+    ImGui::TextUnformatted("Effects/injection: DISABLED in this build");
+    ImGui::Text("Static frames observed: %llu", static_cast<unsigned long long>(staticFramesObserved));
+    ImGui::Text("Frames with 0x64787F0F: %llu | with Primary UI too: %llu",
+                static_cast<unsigned long long>(staticFramesWithWorld),
+                static_cast<unsigned long long>(staticFramesWithWorldAndPrimaryUI));
+    ImGui::Text("Frames where a known UI anchor appeared BEFORE final 0x64787F0F: %llu",
+                static_cast<unsigned long long>(staticFramesWithUIBeforeFinalWorld));
 
-    const char *teacherItems[] = {
-        "Primary UI 0xCF49F7D6",
-        "Bars/full-res 0x30B96240",
-        "Minimap 0xAFB6F656"
-    };
+    ImGui::Spacing();
+    ImGui::Text("World 0x64787F0F: count %u | first draw %llu | last draw %llu | last pass %u",
+                staticFrame.worldCount,
+                static_cast<unsigned long long>(staticFrame.worldFirstDraw),
+                static_cast<unsigned long long>(staticFrame.worldLastDraw),
+                staticFrame.worldLastPass);
+    ImGui::Text("Bars    0x30B96240: first %llu pass %u | candidate %u | same-world-pass %s",
+                static_cast<unsigned long long>(staticFrame.bars.firstDraw),
+                staticFrame.bars.firstPass,
+                staticFrame.bars.candidateOrdinal,
+                staticFrame.bars.sameWorldPass ? "yes" : "no");
+    ImGui::Text("Primary 0xCF49F7D6: first %llu pass %u | candidate %u | same-world-pass %s",
+                static_cast<unsigned long long>(staticFrame.primaryUI.firstDraw),
+                staticFrame.primaryUI.firstPass,
+                staticFrame.primaryUI.candidateOrdinal,
+                staticFrame.primaryUI.sameWorldPass ? "yes" : "no");
+    ImGui::Text("Mini A  0xAFB6F656: first %llu pass %u | candidate %u | same-world-pass %s",
+                static_cast<unsigned long long>(staticFrame.minimapA.firstDraw),
+                staticFrame.minimapA.firstPass,
+                staticFrame.minimapA.candidateOrdinal,
+                staticFrame.minimapA.sameWorldPass ? "yes" : "no");
+    ImGui::Text("Mini B  0xBBB19C94: first %llu pass %u | candidate %u | same-world-pass %s",
+                static_cast<unsigned long long>(staticFrame.minimapB.firstDraw),
+                staticFrame.minimapB.firstPass,
+                staticFrame.minimapB.candidateOrdinal,
+                staticFrame.minimapB.sameWorldPass ? "yes" : "no");
 
-    int selectedTeacher = static_cast<int>(boundaryTeacher);
-    if (ImGui::Combo("Boundary teacher", &selectedTeacher, teacherItems, 3))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxSelectedBoundaryTeacher = static_cast<uint32_t>(selectedTeacher);
-        g_fhxObservedTeacherSignature = FHXPassSignature {};
-        g_fhxLearnedSignature = FHXPassSignature {};
-        g_fhxObservedTeacherSignatureKey = 0;
-        g_fhxLearnedSignatureKey = 0;
-        g_fhxObservedTeacherLocalOccurrence = 0;
-        g_fhxLearnedTeacherLocalOccurrence = 0;
-        g_fhxObservedTeacherPreviousSignatureKey = 0;
-        g_fhxLearnedTeacherPreviousSignatureKey = 0;
-        g_fhxObservedTeacherContextCandidateOrdinal = 0;
-        g_fhxLearnedTeacherContextCandidateOrdinal = 0;
-        g_fhxContextCandidateCounterThisFrame = 0;
-        g_fhxLastContextCandidateCount = 0;
-        g_fhxBaseStableFrames = 0;
-        g_fhxCandidateStableFrames = 0;
-        g_fhxLastSignatureOccurrences = 0;
-        resetFHXValidation(true);
-        resetFHXBoundaryTest();
-    }
-
-    ImGui::Text("Status: %s", fhxBoundaryStatusText(harnessStatus));
-    ImGui::Text("Stage 1 - base: signature 0x%016llX | stable %u/%u frames",
-                static_cast<unsigned long long>(learnedSignatureKey),
-                baseStableFrames,
-                kFHXSignatureStableFramesRequired);
-    ImGui::Text("Base context: occurrence %u of %u matching passes | previous signature 0x%016llX",
-                learnedTeacherLocalOccurrence,
-                lastSignatureOccurrences,
-                static_cast<unsigned long long>(learnedTeacherPreviousSignatureKey));
-    ImGui::Text("Stage 2 - teacher candidate: %u of %u contextual candidates | stable %u/%u frames",
-                learnedTeacherContextCandidateOrdinal,
-                lastContextCandidateCount,
-                candidateStableFrames,
-                kFHXSignatureStableFramesRequired);
-    ImGui::Text("Dry-run prediction: %s | unique %u/%u | missed %u | duplicate hits %u",
-                boundaryValidated ? "PASSED" : (validationActive ? "RUNNING" : (validationAttempted ? "FAILED" : "WAITING")),
-                validationUniqueHitFrames,
-                kFHXValidationPresentsRequired,
-                validationMissedFrames,
-                validationDuplicateHits);
-    ImGui::Text("Teacher verification: confirmed %u/%u | mismatches %u | missing %u",
-                validationTeacherConfirmedFrames,
-                kFHXValidationPresentsRequired,
-                validationTeacherMismatchFrames,
-                validationTeacherMissingFrames);
-    ImGui::Text("Teacher observations: %llu | base changes: %llu | candidate changes: %llu | safe boundary hits: %llu",
-                static_cast<unsigned long long>(teacherObservations),
-                static_cast<unsigned long long>(signatureChanges),
-                static_cast<unsigned long long>(candidateChanges),
-                static_cast<unsigned long long>(safeBoundaryHits));
-
-    if (learnedSignature.valid)
-    {
-        ImGui::Text("Color: %ux%u fmt=%u samples=%u load=%u store=%u attachments=%u",
-                    learnedSignature.colorWidth,
-                    learnedSignature.colorHeight,
-                    learnedSignature.colorFormat,
-                    static_cast<unsigned>(learnedSignature.colorSamples),
-                    learnedSignature.colorLoadOp,
-                    learnedSignature.colorStoreOp,
-                    learnedSignature.colorCount);
-        ImGui::Text("Depth: %s fmt=%u %ux%u samples=%u load=%u store=%u",
-                    learnedSignature.hasDepth ? "yes" : "no",
-                    learnedSignature.depthFormat,
-                    learnedSignature.depthWidth,
-                    learnedSignature.depthHeight,
-                    static_cast<unsigned>(learnedSignature.depthSamples),
-                    learnedSignature.depthLoadOp,
-                    learnedSignature.depthStoreOp);
-    }
-
-    ImGui::Text("Warm-up: %s | quiet presents %u/%u | warmups %llu | reload events %llu",
-                warmupReady ? "READY" : (warmupIssued ? "SETTLING" : (warmupPending ? "QUEUED" : "NOT STARTED")),
-                warmupQuietPresents,
-                kFHXWarmupSettledPresents,
-                static_cast<unsigned long long>(warmupCount),
-                static_cast<unsigned long long>(warmupReloadEvents));
-    ImGui::Text("Requested/remaining: %u / %u | completed injections %llu | present serial %llu",
-                requestedFrames,
-                remainingFrames,
-                static_cast<unsigned long long>(injectionCount),
-                static_cast<unsigned long long>(presentSerial));
-    ImGui::Text("Skipped while unstable: %llu | skipped ambiguous: %llu",
-                static_cast<unsigned long long>(skippedUnstable),
-                static_cast<unsigned long long>(skippedAmbiguous));
-
-    const bool boundaryReady =
-        learnedSignature.valid &&
-        learnedTeacherLocalOccurrence != 0 &&
-        learnedTeacherContextCandidateOrdinal != 0 &&
-        baseStableFrames >= kFHXSignatureStableFramesRequired &&
-        candidateStableFrames >= kFHXSignatureStableFramesRequired &&
-        boundaryValidated;
-
-    if (validationAttempted && !validationActive && !boundaryValidated &&
-        learnedSignature.valid &&
-        learnedTeacherLocalOccurrence != 0 &&
-        learnedTeacherContextCandidateOrdinal != 0 &&
-        baseStableFrames >= kFHXSignatureStableFramesRequired &&
-        candidateStableFrames >= kFHXSignatureStableFramesRequired)
-    {
-        if (ImGui::Button("Retry 60-frame dry-run"))
-        {
-            std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-            startFHXValidation();
-        }
-    }
-
-    if (!boundaryReady)
-        ImGui::BeginDisabled();
-
-    if (ImGui::Button("Test 1 frame"))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        queueFHXInjectionTest(1);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Test 120 frames"))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        queueFHXInjectionTest(120);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Test 600 frames"))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        queueFHXInjectionTest(600);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Test 3600 frames"))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        queueFHXInjectionTest(3600);
-    }
-
-    bool continuousValue = continuousInjection;
-    if (ImGui::Checkbox("Continuous", &continuousValue))
-    {
-        std::lock_guard<std::mutex> lock(g_fhxHuntMutex);
-        g_fhxContinuousInjection = continuousValue;
-        g_fhxRequestedInjectionFrames = 0;
-        g_fhxRemainingInjectionFrames = 0;
-
-        if (continuousValue)
-        {
-            g_fhxWarmupPending = true;
-            g_fhxWarmupIssued = false;
-            g_fhxWarmupReady = false;
-            g_fhxWarmupQuietPresents = 0;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::armed;
-        }
-        else
-        {
-            g_fhxWarmupPending = false;
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::candidate_detected;
-        }
-    }
-
-    if (!boundaryReady)
-        ImGui::EndDisabled();
-
+    ImGui::Spacing();
+    ImGui::Text("Safe passes recorded after final world marker: %u", staticFrame.candidateCount);
+    ImGui::Text("Earliest post-world UI candidate: %u | sig 0x%016llX | stable %u frames",
+                staticFrame.confirmedCandidateOrdinal,
+                static_cast<unsigned long long>(staticFrame.confirmedCandidateSignature),
+                staticStablePatternFrames);
+    ImGui::Text("Candidate RT: %ux%u fmt=%u samples=%u",
+                staticFrame.confirmedCandidateTarget.width,
+                staticFrame.confirmedCandidateTarget.height,
+                staticFrame.confirmedCandidateTarget.formatValue,
+                static_cast<unsigned>(staticFrame.confirmedCandidateTarget.samples));
     ImGui::TextWrapped(
-        "Two-stage passive learner: Stage 1 learns the Primary-UI pass structure, local occurrence and "
-        "preceding structure for 20 stable frames without requiring a candidate ordinal. Only after Stage 1 "
-        "is stable does Stage 2 enumerate the reduced matching candidates and learn which candidate contains "
-        "the Primary UI draw for another 20 stable frames. Then a 60-frame zero-injection dry run requires "
-        "exactly one prediction per frame and teacher confirmation of that same candidate on all 60 frames. "
-        "Global pass numbers, shader-list positions, resource handles and command-list pointers are not used "
-        "as persistent identities.");
+        "This build only measures FHX's native render order. 0x64787F0F is treated as a proposed "
+        "final-world marker, while all known UI hashes are measured independently. If any UI anchor "
+        "consistently appears before the final 0x64787F0F occurrence, that hash cannot be the global "
+        "pre-UI boundary and will be rejected rather than worked around.");
 
     ImGui::Spacing();
     ImGui::TextUnformatted("Hash        First   Last   Count  P1  Pn  T1  Tn  #T  Note");
+
 
     for (const auto &[hash, stat] : frameStats) {
         const char *note = "";
