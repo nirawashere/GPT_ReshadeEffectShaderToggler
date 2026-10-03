@@ -179,14 +179,13 @@ void onBindPipeline(command_list *cmdList, pipeline_stage stages, pipeline pipel
     ++g_primaryUiBindsOutsidePass;
 }
 
-bool onBeginRenderPass(command_list *cmdList,
+void onBeginRenderPass(command_list *cmdList,
                        uint32_t count,
                        const render_pass_render_target_desc *rts,
-                       const render_pass_depth_stencil_desc *,
-                       render_pass_flags)
+                       const render_pass_depth_stencil_desc *)
 {
     if (g_insideManualRender || cmdList == nullptr)
-        return false;
+        return;
 
     bool shouldAttempt = false;
 
@@ -246,17 +245,15 @@ bool onBeginRenderPass(command_list *cmdList,
         g_commandStates[cmdList].insideRenderPass = true;
     }
 
-    return false;
 }
 
-bool onEndRenderPass(command_list *cmdList)
+void onEndRenderPass(command_list *cmdList)
 {
     if (g_insideManualRender || cmdList == nullptr)
-        return false;
+        return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
     g_commandStates[cmdList].insideRenderPass = false;
-    return false;
 }
 
 void onInitEffectRuntime(effect_runtime *runtime)
