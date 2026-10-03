@@ -1225,28 +1225,6 @@ static void onBeginRenderPassFHX(command_list *commandList,
     }
 
     if (runtime == nullptr)
-        {
-            g_fhxBoundaryInjectStatus = FHXBoundaryInjectStatus::no_runtime;
-            return;
-        }
-
-        g_fhxLastInjectionPresentSerial = g_fhxPresentSerial;
-
-        if (g_fhxWarmupPending && !g_fhxWarmupIssued)
-        {
-            g_fhxWarmupPending = false;
-            g_fhxWarmupIssued = true;
-            g_fhxWarmupReady = false;
-            g_fhxWarmupQuietPresents = 0;
-            performWarmup = true;
-        }
-        else if (g_fhxWarmupReady)
-        {
-            performInjection = true;
-        }
-    }
-
-    if (runtime == nullptr)
         return;
 
     if (!runtime->get_effects_state())
